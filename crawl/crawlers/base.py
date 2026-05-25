@@ -931,8 +931,10 @@ class BaseCrawler:
     def incremental_sync(
         self,
         known_episode_ids: frozenset[str] | None = None,
+        *,
+        log_prefix: str = "incremental_sync",
     ) -> Iterator[RawEpisode]:
-        """Steady-state pull — fetch only slugs whose canonical
+        """Pre-fetch skip pull — fetch only slugs whose canonical
         ``episode_id`` is not already present in
         ``known_episode_ids``.
 
@@ -941,15 +943,24 @@ class BaseCrawler:
         The crawler treats the set as opaque — the policy that
         produced it lives in :class:`crawl.pipeline.Pipeline`
         (see :meth:`crawl.pipeline.Pipeline._load_governance_state`
-        and :meth:`crawl.pipeline.Pipeline._known_ids_for` for the
-        composition rules). Concretely, the set contains every
-        episode currently in the pack (so re-fetching would just
-        round-trip the same content) AND every previously-rejected
-        episode whose ``rights_code`` is still outside the active
-        rights allowlist (so re-fetching would just re-reject and
-        append another deprecated governance row). It does *not*
-        contain previously-rejected episodes whose ``rights_code``
-        is now in the allowlist — those need to be re-fetched so
+        and :meth:`crawl.pipeline.Pipeline._pre_fetch_skip_set_for`
+        for the composition rules). Both pipeline modes call
+        this method; only the skip-set composition differs.
+
+        * **Incremental mode** (``Pipeline(incremental=True)``):
+          the set contains every episode currently in the pack
+          *and* every previously-rejected episode whose
+          ``rights_code`` is still outside the active rights
+          allowlist.
+        * **Default mode** (``incremental=False``, the
+          historical behaviour): the set contains only the
+          persistently-rejected subset — admitted episodes are
+          still re-fetched so the content-hash dedup gate can
+          detect legitimate transcript updates.
+
+        In either mode the set does *not* contain
+        previously-rejected episodes whose ``rights_code`` is
+        now in the allowlist — those need to be re-fetched so
         the rights gate can re-admit under the new policy.
 
         Passing ``None`` or an empty set falls back to a full
@@ -992,11 +1003,16 @@ class BaseCrawler:
         if not known:
             # Empty cursor — fall through to the full walk. This is
             # the bootstrap case (no governance log yet) and is
-            # documented as the safe default.
+            # documented as the safe default. The full walk is the
+            # boot-mode path: it always emits the ``initial_sync —``
+            # log tag regardless of what ``log_prefix`` says here,
+            # because :meth:`initial_sync` itself hard-codes that
+            # tag (and operators rely on grepping for it to
+            # identify the boot phase).
             yield from self.initial_sync()
             return
 
-        slugs = self._enumerate_slugs(log_prefix="incremental_sync")
+        slugs = self._enumerate_slugs(log_prefix=log_prefix)
         skipped = 0
         attempted = 0
         errors = 0
@@ -1021,8 +1037,9 @@ class BaseCrawler:
         # rather than conflating the latter two under a single
         # "candidates fetched" tag.
         LOG.info(
-            "%s: incremental_sync — %d known skipped, %d attempted, %d failed",
+            "%s: %s — %d known skipped, %d attempted, %d failed",
             self.publisher_id,
+            log_prefix,
             skipped,
             attempted,
             errors,
