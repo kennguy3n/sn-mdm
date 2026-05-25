@@ -51,3 +51,26 @@ def test_every_config_carries_tags() -> None:
         assert cfg.function_tags, f"{pid} missing function_tags"
         assert cfg.business_model_tags, f"{pid} missing business_model_tags"
         assert cfg.country_region, f"{pid} missing country_region"
+
+
+def test_ted_worklife_has_empty_host_to_avoid_legacy_misattribution() -> None:
+    """``ted_worklife`` is the one publisher in the registry that
+    must NOT carry a static config host. WorkLife has changed
+    hosts (Adam Grant 2018-2024, Molly Graham 2024-present) and
+    TED keeps older transcripts under the same hub. Falling back
+    to a single "current host" in :meth:`BaseCrawler.emit_episode`
+    would mis-attribute the legacy Adam Grant transcripts.
+
+    The crawler also returns ``RawEpisode(hosts=[])`` — see
+    ``test_ted_fetch_transcript_emits_empty_hosts`` — and the two
+    must agree, because ``emit_episode``'s fallback expression
+    ``raw.hosts or ([config.host] if config.host else [])``
+    short-circuits to ``[]`` only when *both* are falsy.
+    """
+    configs = load_config(REPO_CONFIG)
+    cfg = configs["ted_worklife"]
+    assert cfg.host == "", (
+        "ted_worklife must have host='' so emit_episode's fallback "
+        "does not stamp legacy Adam Grant episodes with the current "
+        "host"
+    )

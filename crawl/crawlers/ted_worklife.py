@@ -143,14 +143,14 @@ class TedWorklifeCrawler(BaseCrawler):
             publication_date=publication_date,
             raw_bytes=resp.content,
             content_type="text/html",
-            # The current run is hosted by Molly Graham (the show
-            # rebranded from Adam Grant in 2024). Recording the
-            # *current* host on every episode would be wrong for
-            # the older Adam Grant transcripts if TED ever
-            # re-publishes them — so we leave ``hosts`` empty and
-            # let the normaliser surface the speaker labels from
-            # the transcript body, which is what ``chunk_normalised_text``
-            # uses anyway.
+            # WorkLife has changed hosts (Adam Grant 2018-2024,
+            # Molly Graham 2024-present) and TED keeps older
+            # transcripts under the same hub. ``hosts=[]`` plus
+            # ``host = ""`` in crawl_config.toml means
+            # :meth:`BaseCrawler.emit_episode` falls through to an
+            # empty list rather than stamping a static fallback —
+            # the only host signal that ships is whatever the
+            # transcript body's speaker labels carry.
             hosts=[],
             guests=[],
             asset_urls=[],

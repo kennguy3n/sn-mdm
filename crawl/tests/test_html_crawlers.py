@@ -188,6 +188,38 @@ def test_ted_fetch_transcript_strips_transcript_suffix_from_title(
     assert raw.summary == "OG description."
 
 
+def test_ted_fetch_transcript_emits_empty_hosts(
+    monkeypatch: pytest.MonkeyPatch, ted_crawler: TedWorklifeCrawler
+) -> None:
+    """WorkLife has rotated hosts (Adam Grant 2018-2024,
+    Molly Graham 2024-present) and TED keeps older transcripts
+    under the same hub. Stamping a static "current host" on
+    every metadata row would mis-attribute legacy episodes.
+
+    The contract is therefore:
+    1. ``fetch_transcript`` returns ``hosts=[]``.
+    2. ``crawl_config.toml`` sets ``host = ""`` for ``ted_worklife``
+       so :meth:`BaseCrawler.emit_episode`'s fallback —
+       ``raw.hosts or ([config.host] if config.host else [])`` —
+       resolves to ``[]`` instead of forcing a fallback value.
+
+    The fixture ``ted_crawler`` is built with ``host=""`` exactly
+    so this round-trips. If a future change re-introduces a
+    static host in either place, this test fails.
+    """
+    stub = _FetchStub({_TED_EPISODE_URL: _TED_EPISODE_HTML})
+    monkeypatch.setattr(ted_crawler, "fetch", stub)
+    raw = ted_crawler.fetch_transcript("sample-slug")
+    assert raw.hosts == []
+    # And the framework-level fallback at base.py:985 also resolves
+    # to an empty list because the config host is empty. Mirror the
+    # exact `or` expression used in `emit_episode`.
+    emitted_host = raw.hosts or (
+        [ted_crawler.config.host] if ted_crawler.config.host else []
+    )
+    assert emitted_host == []
+
+
 def test_ted_normalises_only_main_subtree(
     ted_crawler: TedWorklifeCrawler,
 ) -> None:

@@ -143,9 +143,16 @@ overlap_tokens = 120
 [sources.ted_worklife]
 publisher_name        = "TED"
 base_url              = "https://www.ted.com/podcasts"
-host                  = "Molly Graham"
+# Deliberately empty: the WorkLife show has changed hosts (Adam
+# Grant -> Molly Graham) and TED keeps older transcripts under
+# the same hub. Stamping a single "current host" on every
+# metadata row would mis-attribute legacy Adam Grant episodes.
+# emit_episode therefore falls through to an empty list so the
+# only host signal that ships is the speaker labels in the
+# transcript body itself.
+host                  = ""
 series_id             = "worklife"
-series_title          = "WorkLife with Molly Graham (formerly Adam Grant)"
+series_title          = "WorkLife (Adam Grant 2018-2024, Molly Graham 2024-present)"
 primary_series_url    = "https://www.ted.com/podcasts/worklife-transcripts"
 rights_code           = "cc_by_nc_nd"
 rights_summary        = "CC BY-NC-ND 4.0; per-episode transcripts at /podcasts/{slug}-transcript, hub at /podcasts/worklife-transcripts."
