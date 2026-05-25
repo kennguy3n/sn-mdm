@@ -329,6 +329,199 @@ def test_exit_code_one_on_silent_regression() -> None:
     assert exit_code_for(totals) == 1
 
 
+class DiscoveryMergeCrawler(BaseCrawler):
+    """Concrete subclass that exercises the base ``initial_sync``.
+
+    Unlike :class:`FakeCrawler`, this *does not* override
+    ``initial_sync`` — we want the production merge logic
+    (seed dedup + discovery merge + first-seen ordering + log
+    line arithmetic) to run as-shipped. ``_discover_episode_slugs``
+    and ``fetch_transcript`` are stubbed so the test never
+    touches the network.
+    """
+
+    publisher_id = "merge_fake"
+    publisher_name = "Merge Fake"
+
+    def __init__(
+        self,
+        config: CrawlerConfig,
+        packs_root: Path,
+        discovered: list[str],
+    ) -> None:
+        self.config = config
+        self.packs_root = Path(packs_root)
+        self.sync_state = self._make_sync_state()
+        self._last_request_at = 0.0
+        self._robots_cache = {}
+        self.session = None  # type: ignore[assignment]
+        self._discovered = list(discovered)
+        self.fetched: list[str] = []
+
+    @staticmethod
+    def _make_sync_state():
+        from crawl.crawlers.base import SyncState
+
+        return SyncState()
+
+    def _discover_episode_slugs(self) -> list[str]:
+        return list(self._discovered)
+
+    def fetch_transcript(self, slug: str) -> RawEpisode:  # type: ignore[override]
+        self.fetched.append(slug)
+        return RawEpisode(
+            episode_slug=slug,
+            title=f"Title for {slug}",
+            primary_url=f"https://example.com/episodes/{slug}",
+            publication_date="2024-01-01",
+            raw_bytes=b"<html><body><p>X: y</p></body></html>",
+            content_type="text/html",
+            hosts=["X"],
+        )
+
+    def normalize(self, raw):  # type: ignore[override]
+        from crawl.crawlers.base import canonicalise_text, content_hash
+
+        text = canonicalise_text("# title\n\nX: y")
+        return NormalisedEpisode(raw=raw, normalised_markdown=text, content_hash=content_hash(text))
+
+
+def _merge_config(seeds: list[str]) -> CrawlerConfig:
+    cfg = _config()
+    return CrawlerConfig(
+        # Align with DiscoveryMergeCrawler.publisher_id so the
+        # config would pass production __init__ validation (the
+        # test bypasses super().__init__, but matching IDs makes
+        # the fixture honest about the contract production
+        # crawlers operate under).
+        publisher_id="merge_fake",
+        publisher_name=cfg.publisher_name,
+        base_url=cfg.base_url,
+        rights_code=cfg.rights_code,
+        rights_summary=cfg.rights_summary,
+        country_region=cfg.country_region,
+        industry_tags=cfg.industry_tags,
+        function_tags=cfg.function_tags,
+        business_model_tags=cfg.business_model_tags,
+        source_type=cfg.source_type,
+        language=cfg.language,
+        host=cfg.host,
+        episodes=list(seeds),
+    )
+
+
+def test_initial_sync_merges_seeds_and_discovery_first_seen_order(
+    tmp_path: Path,
+) -> None:
+    """Seed list comes first, discovery fills in the rest. Order
+    is preserved so the configured priority is respected even
+    when discovery happens to yield seeds again."""
+    cfg = _merge_config(seeds=["seed-a", "seed-b"])
+    crawler = DiscoveryMergeCrawler(
+        cfg, tmp_path, discovered=["seed-b", "discovered-c", "discovered-d"]
+    )
+    list(crawler.initial_sync())
+    assert crawler.fetched == ["seed-a", "seed-b", "discovered-c", "discovered-d"]
+
+
+def test_initial_sync_dedupes_duplicate_seeds(tmp_path: Path) -> None:
+    """A config that lists the same slug twice in ``episodes`` must
+    not cause a double fetch, and the dedup must not displace a
+    later discovery slug. This is the regression case that
+    motivated the seed-side ``dict.fromkeys`` pass.
+    """
+    cfg = _merge_config(seeds=["seed-a", "seed-a", "seed-b"])
+    crawler = DiscoveryMergeCrawler(
+        cfg, tmp_path, discovered=["discovered-c"]
+    )
+    list(crawler.initial_sync())
+    assert crawler.fetched == ["seed-a", "seed-b", "discovered-c"]
+
+
+def test_initial_sync_pure_discovery_when_no_seeds(tmp_path: Path) -> None:
+    cfg = _merge_config(seeds=[])
+    crawler = DiscoveryMergeCrawler(cfg, tmp_path, discovered=["a", "b", "c"])
+    list(crawler.initial_sync())
+    assert crawler.fetched == ["a", "b", "c"]
+
+
+def test_initial_sync_pure_seed_when_no_discovery(tmp_path: Path) -> None:
+    cfg = _merge_config(seeds=["only-seed"])
+    crawler = DiscoveryMergeCrawler(cfg, tmp_path, discovered=[])
+    list(crawler.initial_sync())
+    assert crawler.fetched == ["only-seed"]
+
+
+def test_initial_sync_discovery_overlap_does_not_duplicate(tmp_path: Path) -> None:
+    """If discovery yields a slug that's already in the seed set,
+    ``fetch_transcript`` must run exactly once for that slug."""
+    cfg = _merge_config(seeds=["same-slug"])
+    crawler = DiscoveryMergeCrawler(
+        cfg, tmp_path, discovered=["same-slug", "different-slug"]
+    )
+    list(crawler.initial_sync())
+    assert crawler.fetched == ["same-slug", "different-slug"]
+
+
+class _FailingDiscoveryCrawler(DiscoveryMergeCrawler):
+    """Subclass whose ``_discover_episode_slugs`` raises. Used to
+    verify that the seed list is still crawled when discovery
+    blows up — the regression case the round-8 review flagged.
+    """
+
+    def _discover_episode_slugs(self) -> list[str]:
+        raise RuntimeError("simulated index-walker failure")
+
+
+def test_initial_sync_discovery_failure_does_not_swallow_seeds(
+    tmp_path: Path, caplog
+) -> None:
+    """A future ``_discover_episode_slugs`` override that raises
+    must NOT prevent the configured seed list from being crawled.
+    The guard sits at the merge site so the contract holds for
+    every subclass without each subclass having to remember to
+    catch its own exceptions.
+    """
+    import logging
+
+    cfg = _merge_config(seeds=["seed-a", "seed-b"])
+    crawler = _FailingDiscoveryCrawler(cfg, tmp_path, discovered=[])
+    with caplog.at_level(logging.WARNING, logger="crawl.crawlers.base"):
+        list(crawler.initial_sync())
+    # Seeds were still fetched in order.
+    assert crawler.fetched == ["seed-a", "seed-b"]
+    # And the failure was logged as a warning naming the publisher.
+    assert any(
+        "_discover_episode_slugs raised" in rec.getMessage()
+        and "merge_fake" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_initial_sync_log_counts_after_seed_dedup(
+    tmp_path: Path, caplog
+) -> None:
+    """The INFO log line reports unique-seed + net-new-discovered.
+    With duplicate seeds + an overlapping discovery slug, the
+    arithmetic must still satisfy seed + discovered = total."""
+    import logging
+
+    cfg = _merge_config(seeds=["seed-a", "seed-a", "seed-b"])
+    crawler = DiscoveryMergeCrawler(
+        cfg, tmp_path, discovered=["seed-b", "discovered-c"]
+    )
+    with caplog.at_level(logging.INFO, logger="crawl.crawlers.base"):
+        list(crawler.initial_sync())
+    summary = next(
+        rec for rec in caplog.records if "initial_sync" in rec.getMessage()
+    )
+    msg = summary.getMessage()
+    # 2 unique seeds + 1 net-new discovered (seed-b is dropped as
+    # an overlap) = 3 unique slugs total.
+    assert "2 seed + 1 discovered" in msg
+    assert "3 unique slugs" in msg
+
+
 def test_exit_code_zero_on_empty_run() -> None:
     # No publishers / no episodes seen at all is also not a
     # regression — could be a config that filters out everything,

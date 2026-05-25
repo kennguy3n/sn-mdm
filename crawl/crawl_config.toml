@@ -234,11 +234,11 @@ overlap_tokens = 120
 
 [sources.imd]
 publisher_name        = "IMD Business School"
-base_url              = "https://www.imd.org/ibyimd/category/podcasts"
+base_url              = "https://www.imd.org/ibyimd/podcasts"
 host                  = ""
 series_id             = "ibyimd"
 series_title          = "I by IMD Podcasts"
-primary_series_url    = "https://www.imd.org/ibyimd/category/podcasts"
+primary_series_url    = "https://www.imd.org/ibyimd/category/podcasts/"
 rights_code           = "free_access_copyrighted"
 rights_summary        = "Free-access copyrighted; transcripts on the I by IMD blog."
 country_region        = ["Switzerland", "global"]
@@ -326,11 +326,11 @@ overlap_tokens = 120
 
 [sources.microsoft_cyber]
 publisher_name        = "Microsoft Worldwide Public Sector"
-base_url              = "https://wwps.microsoft.com/blog/episodes"
+base_url              = "https://wwps.microsoft.com"
 host                  = ""
 series_id             = "wwps_cyber"
 series_title          = "WWPS Cybersecurity Podcast"
-primary_series_url    = "https://wwps.microsoft.com/blog/episodes"
+primary_series_url    = "https://wwps.microsoft.com/episodes/"
 rights_code           = "free_access_copyrighted"
 rights_summary        = "Free-access copyrighted; transcript PDFs linked from each episode page."
 country_region        = ["US", "global"]

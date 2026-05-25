@@ -14,6 +14,7 @@ sees only the transcript text.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
@@ -21,13 +22,64 @@ from bs4 import BeautifulSoup
 
 from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 
+LOG = logging.getLogger(__name__)
+
+
+_INDEX_URL = "https://www.acquired.fm/episodes"
+# Accept relative ("/episodes/<slug>") and absolute
+# ("https://www.acquired.fm/episodes/<slug>") hrefs — the index
+# emits both depending on whether the link is a card or a deep
+# link from a banner / "related episodes" tile.
+_INDEX_HREF_RE = re.compile(
+    r"^(?:https?://(?:www\.)?acquired\.fm)?/episodes/([a-z0-9][a-z0-9\-]*)/?$"
+)
+
 
 class AcquiredCrawler(BaseCrawler):
     publisher_id = "acquired"
     publisher_name = "Acquired"
 
+    #: Cap on how many slugs ``_discover_episode_slugs`` may emit
+    #: from a single index walk. Keeps a one-shot initial sync
+    #: from trying to download Acquired's entire 250-episode
+    #: archive in one run — the operator can bump the seed list
+    #: explicitly when they want deeper coverage.
+    DISCOVER_CAP = 25
+
     def _episode_url(self, slug: str) -> str:
         return f"https://www.acquired.fm/episodes/{slug}"
+
+    def _discover_episode_slugs(self) -> list[str]:
+        """Walk the Acquired episode index and pull the first
+        :attr:`DISCOVER_CAP` per-episode slugs.
+
+        The /episodes index is plain server-rendered HTML; each
+        episode card carries an ``<a href=\"/episodes/<slug>\">``
+        link we extract via :data:`_INDEX_HREF_RE`. We filter
+        ``href`` to local paths only so the regex doesn't trip
+        on absolute social-share URLs that contain the same
+        substring.
+        """
+        try:
+            resp = self.fetch(_INDEX_URL)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("acquired: index walk failed: %s", exc)
+            return []
+        soup = BeautifulSoup(resp.text, "lxml")
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for a in soup.find_all("a", href=True):
+            m = _INDEX_HREF_RE.match(a["href"])
+            if not m:
+                continue
+            slug = m.group(1)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+            if len(slugs) >= self.DISCOVER_CAP:
+                break
+        return slugs
 
     def fetch_transcript(self, episode_slug: str) -> RawEpisode:
         url = self._episode_url(episode_slug)

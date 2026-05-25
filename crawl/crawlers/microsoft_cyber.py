@@ -1,28 +1,71 @@
 """Microsoft public sector cyber podcast crawler.
 
-Microsoft's worldwide public sector ("WWPS") cyber podcast lives at
-``https://wwps.microsoft.com/blog/episodes/{slug}`` (canonical hub
-URL — slugs are taken from the source registry). Many episode pages
-link to a transcript PDF.
+Microsoft's worldwide public sector ("WWPS") site hosts two
+podcast shows:
+
+* ``Public Sector Future`` — permalink prefix
+  ``https://wwps.microsoft.com/episodes/{slug}/``
+* ``Future of Infrastructure`` — permalink prefix
+  ``https://wwps.microsoft.com/infrastructure-episodes/{slug}/``
+
+Slugs in this crawler are namespaced as ``"<prefix>/<slug>"`` so
+both shows can coexist in the same registry without ambiguity.
+Many episode pages link to a transcript PDF; we follow that when
+present, otherwise we extract from the HTML.
 """
 
 from __future__ import annotations
 
+import logging
+import re
 import urllib.parse
 
 from bs4 import BeautifulSoup
 
 from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 
+LOG = logging.getLogger(__name__)
+
+_SITEMAP_URLS = (
+    "https://wwps.microsoft.com/post-sitemap1.xml",
+    "https://wwps.microsoft.com/post-sitemap2.xml",
+)
+_EPISODE_LOC_RE = re.compile(
+    r"<loc>\s*https?://wwps\.microsoft\.com/"
+    r"((?:episodes|infrastructure-episodes)/[a-z0-9][a-z0-9\-]*)/?\s*</loc>"
+)
+
 
 class MicrosoftCyberCrawler(BaseCrawler):
     publisher_id = "microsoft_cyber"
     publisher_name = "Microsoft Worldwide Public Sector"
+    DISCOVER_CAP = 25
 
-    BASE = "https://wwps.microsoft.com/blog/episodes"
+    BASE = "https://wwps.microsoft.com"
 
     def _episode_url(self, slug: str) -> str:
+        # Slug is "<prefix>/<slug>" where prefix is either
+        # ``episodes`` or ``infrastructure-episodes``.
         return f"{self.BASE}/{slug}"
+
+    def _discover_episode_slugs(self) -> list[str]:
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for sitemap_url in _SITEMAP_URLS:
+            try:
+                resp = self.fetch(sitemap_url)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("microsoft_cyber: %s failed: %s", sitemap_url, exc)
+                continue
+            for m in _EPISODE_LOC_RE.finditer(resp.text):
+                slug = m.group(1)
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                slugs.append(slug)
+                if len(slugs) >= self.DISCOVER_CAP:
+                    return slugs
+        return slugs
 
     def fetch_transcript(self, episode_slug: str) -> RawEpisode:
         url = self._episode_url(episode_slug)

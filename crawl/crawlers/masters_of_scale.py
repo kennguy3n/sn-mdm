@@ -8,6 +8,7 @@ word "Transcript" — extraction strategy matches Exit Five's.
 
 from __future__ import annotations
 
+import logging
 import re
 import urllib.parse
 
@@ -15,13 +16,44 @@ from bs4 import BeautifulSoup
 
 from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 
+LOG = logging.getLogger(__name__)
+
+_EPISODE_SITEMAP_URL = "https://mastersofscale.com/episode-sitemap.xml"
+_EPISODE_LOC_RE = re.compile(
+    r"<loc>\s*https?://mastersofscale\.com/episode/([a-z0-9][a-z0-9\-]*)/?\s*</loc>"
+)
+
 
 class MastersOfScaleCrawler(BaseCrawler):
     publisher_id = "masters_of_scale"
     publisher_name = "Masters of Scale"
+    DISCOVER_CAP = 25
 
     def _episode_url(self, slug: str) -> str:
         return f"https://mastersofscale.com/episode/{slug}"
+
+    def _discover_episode_slugs(self) -> list[str]:
+        """Pull slugs from the WordPress ``episode-sitemap.xml``.
+        Masters of Scale exposes 700+ episode permalinks there in
+        publication order (newest first); the cap keeps the
+        initial sync to a manageable window.
+        """
+        try:
+            resp = self.fetch(_EPISODE_SITEMAP_URL)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("masters_of_scale: sitemap fetch failed: %s", exc)
+            return []
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for m in _EPISODE_LOC_RE.finditer(resp.text):
+            slug = m.group(1)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+            if len(slugs) >= self.DISCOVER_CAP:
+                break
+        return slugs
 
     def fetch_transcript(self, episode_slug: str) -> RawEpisode:
         url = self._episode_url(episode_slug)

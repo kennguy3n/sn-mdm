@@ -677,16 +677,97 @@ class BaseCrawler:
     # -- contract surface --------------------------------------------------
 
     def initial_sync(self) -> Iterator[RawEpisode]:
-        """First-time pull — walk the entire source surface. Default
-        implementation iterates over the configured episode slugs;
-        sources with a discoverable index should override.
+        """First-time pull — walk the entire source surface.
+
+        Episode slugs come from two sources, merged in this order:
+
+        1. The configured seed list (:attr:`config.episodes`) — a
+           curated set the operator wants crawled regardless of
+           what discovery turns up.
+        2. :meth:`_discover_episode_slugs` — concrete crawlers
+           override this to walk the source's index page and
+           enumerate episodes. The default implementation returns
+           an empty list, so a crawler that ships without a
+           discovery override is purely seed-driven.
+
+        Slugs are de-duplicated preserving first-seen order so the
+        seed list still dictates priority. This is the contract
+        that lets us add new sources by populating the registry +
+        an index-walker without touching the pipeline.
+
+        Discovery is best-effort: if :meth:`_discover_episode_slugs`
+        raises, the exception is logged and the seed list still
+        runs. Overrides are *not* required to catch their own
+        exceptions — the guard sits at the merge site so the
+        invariant holds for every subclass, current and future.
         """
-        for slug in self.config.episodes:
+        seen: set[str] = set()
+        slugs: list[str] = []
+        # Compute the *unique* seed count first so the discovered
+        # count we log is the true count of slugs that came in via
+        # ``_discover_episode_slugs`` and not just the difference
+        # between the total and the (possibly duplicate-bloated)
+        # raw seed length. Without this, configs with duplicate
+        # entries in ``episodes`` would silently undercount the
+        # discovery side.
+        seed_slugs = list(dict.fromkeys(self.config.episodes))
+        # Discovery is best-effort: a publisher's index page can 5xx,
+        # rate-limit us, or change shape on any given run. When that
+        # happens we still want the configured seeds to be crawled —
+        # silently dropping them because discovery raised would be a
+        # silent regression for any publisher that has both a curated
+        # seed set and a flaky index. We wrap the discovery call here
+        # (rather than relying on every override to catch internally)
+        # so the contract is enforced at the merge site for every
+        # subclass, current and future.
+        try:
+            discovered_slugs = list(self._discover_episode_slugs())
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(
+                "%s: _discover_episode_slugs raised (%s); falling back to seed list",
+                self.publisher_id,
+                exc,
+            )
+            discovered_slugs = []
+        for source in (seed_slugs, discovered_slugs):
+            for slug in source:
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                slugs.append(slug)
+
+        LOG.info(
+            "%s: initial_sync — %d seed + %d discovered → %d unique slugs",
+            self.publisher_id,
+            len(seed_slugs),
+            max(0, len(slugs) - len(seed_slugs)),
+            len(slugs),
+        )
+
+        for slug in slugs:
             try:
                 yield self.fetch_transcript(slug)
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("fetch_transcript(%s) failed: %s", slug, exc)
                 continue
+
+    def _discover_episode_slugs(self) -> list[str]:
+        """Return slugs discovered by walking the source's index
+        page. Concrete crawlers override; the default returns the
+        empty list so a crawler without an index walker still
+        works as long as :attr:`config.episodes` is populated.
+
+        Implementations should:
+
+        * Use :meth:`fetch` so robots.txt + rate limiting + the
+          custom User-Agent are honoured.
+        * Return only the per-episode path component
+          (:meth:`_episode_url` will turn it into a fetch URL).
+        * Cap the discovered list (typically the first ~25
+          episodes) so a single ``initial_sync`` doesn't try to
+          download a publisher's entire archive in one shot.
+        """
+        return []
 
     def incremental_sync(self, cursor: str | None = None) -> Iterator[RawEpisode]:
         """Steady-state pull. Default implementation re-runs the
@@ -858,11 +939,18 @@ class BaseCrawler:
             "text/plain": ".txt",
         }.get(raw.content_type, ".bin")
         path = self._publisher_dir("raw") / f"{raw.episode_slug}{ext}"
+        # Some publishers namespace their slugs (e.g. BCG's
+        # ``<show>/<slug>``, Microsoft's ``episodes/<slug>``) so
+        # the resolved file path can sit several directories
+        # below the publisher root. Materialise the parent chain
+        # before writing.
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(raw.raw_bytes)
         return path
 
     def save_normalised(self, normalised: NormalisedEpisode) -> Path:
         path = self._publisher_dir("normalized") / f"{normalised.raw.episode_slug}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(normalised.normalised_markdown, encoding="utf-8")
         return path
 

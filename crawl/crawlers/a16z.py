@@ -12,22 +12,65 @@ are present, and fall back to the editorial summary otherwise.
 
 from __future__ import annotations
 
+import logging
 import re
 
 from bs4 import BeautifulSoup
 
 from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 
+LOG = logging.getLogger(__name__)
+
+# a16z exposes a canonical podcast sitemap. Each ``<loc>`` is a
+# fully-qualified episode permalink — the most reliable
+# enumeration channel available because the site itself is
+# client-rendered.
+_SITEMAP_URLS = (
+    "https://a16z.com/podcast-sitemap.xml",
+    "https://a16z.com/podcast-sitemap2.xml",
+)
+_LOC_RE = re.compile(r"<loc>\s*(https?://a16z\.com/podcast/([a-z0-9][a-z0-9\-]*))/?\s*</loc>")
+
 
 class A16zCrawler(BaseCrawler):
     publisher_id = "a16z"
     publisher_name = "Andreessen Horowitz"
+    DISCOVER_CAP = 25
 
     # a16z asks crawlers to keep below 1 req/sec — match the base
     # default which already does.
 
     def _episode_url(self, slug: str) -> str:
         return f"https://a16z.com/podcast/{slug}"
+
+    def _discover_episode_slugs(self) -> list[str]:
+        """Pull episode slugs from a16z's podcast sitemap.
+
+        The site is a Next.js SPA so the regular index pages
+        (``/podcasts``, ``/podcasts/a16z-show/``) only render
+        the show list — the episode tiles are populated client-
+        side and are invisible to a plain HTTP GET. The
+        ``podcast-sitemap.xml`` (and ``…2.xml``) endpoint is the
+        canonical machine-readable enumeration of every podcast
+        permalink and is server-rendered.
+        """
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for sitemap_url in _SITEMAP_URLS:
+            try:
+                resp = self.fetch(sitemap_url)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("a16z: sitemap %s failed: %s", sitemap_url, exc)
+                continue
+            for m in _LOC_RE.finditer(resp.text):
+                slug = m.group(2)
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                slugs.append(slug)
+                if len(slugs) >= self.DISCOVER_CAP:
+                    return slugs
+        return slugs
 
     def fetch_transcript(self, episode_slug: str) -> RawEpisode:
         url = self._episode_url(episode_slug)

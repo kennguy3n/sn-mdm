@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Pack format, SQLCipher+FTS5 index, multi-lane search, and compact .pack export for sn-mdm content packs."
 
+[[bin]]
+name = "pack-build"
+path = "src/bin/pack_build.rs"
+
 [dependencies]
 thiserror.workspace = true
 anyhow.workspace = true
