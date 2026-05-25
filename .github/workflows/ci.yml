@@ -8,6 +8,16 @@ on:
 permissions:
   contents: read
 
+# Single source of truth for the pinned rustc release used by the
+# ``rust`` and ``napi-build`` jobs. Promoted to a workflow-level env
+# var so the toolchain-install step and the cache key can't drift:
+# a one-line bump to ``RUST_TOOLCHAIN`` propagates everywhere. The
+# MSRV job pins 1.85.0 separately because it covers the workspace
+# floor, not the napi-rs 3.x effective MSRV — see the ``msrv`` job
+# comment below.
+env:
+  RUST_TOOLCHAIN: "1.88.0"
+
 jobs:
   rust:
     name: rust (fmt / clippy / test)
@@ -28,8 +38,8 @@ jobs:
         # the documented MSRV stays meaningful for ``pack_core``
         # and the Python pipeline.
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
-          rustup default 1.88.0
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -44,11 +54,14 @@ jobs:
           # ``restore-keys`` still lets us reuse the registry / git
           # caches across builds, so the cost is only a recompile
           # of the dependency tree, not a re-download. The toolchain
-          # version is part of the cache key so a future rustc bump
-          # cleanly invalidates the previous build artefacts.
-          key: ${{ runner.os }}-cargo-rust-1.88.0-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          # version (sourced from the workflow-level ``RUST_TOOLCHAIN``
+          # env var) is part of the cache key so a future rustc bump
+          # cleanly invalidates the previous build artefacts — the
+          # install step and the cache key cannot drift.
+          key: ${{ runner.os }}-cargo-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-rust-1.88.0-
+            ${{ runner.os }}-cargo-rust-${{ env.RUST_TOOLCHAIN }}-
+            ${{ runner.os }}-cargo-rust-
             ${{ runner.os }}-cargo-stable-
 
       - name: cargo fmt --check
@@ -101,10 +114,13 @@ jobs:
 
       - name: Install Rust toolchain (pinned)
         # Same pin as the ``rust`` job — see comment there for why
-        # we don't track the unpinned ``stable`` channel.
+        # we don't track the unpinned ``stable`` channel. Both jobs
+        # source the version from the workflow-level
+        # ``RUST_TOOLCHAIN`` env var so a future bump is a single
+        # edit at the top of the file.
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default 1.88.0
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -127,11 +143,11 @@ jobs:
           # registry / git index warm-start from any sibling job's
           # cache, so dependency downloads stay deduped without
           # forcing repeated full rebuilds of the napi cdylib.
-          key: ${{ runner.os }}-cargo-napi-1.88.0-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-napi-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-napi-1.88.0-
+            ${{ runner.os }}-cargo-napi-${{ env.RUST_TOOLCHAIN }}-
             ${{ runner.os }}-cargo-napi-
-            ${{ runner.os }}-cargo-rust-1.88.0-
+            ${{ runner.os }}-cargo-rust-${{ env.RUST_TOOLCHAIN }}-
 
       - name: cargo test -p pack_napi --lib
         run: cargo test -p pack_napi --lib
