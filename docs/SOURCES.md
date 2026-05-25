@@ -43,16 +43,16 @@ Every episode is tagged across the 5 families
 | BCG Featured Insights                  | `bcg.py`                      | `bcg.com/featured-insights/podcasts/{slug}` + PDF transcripts        | `free_access_copyrighted` | global            |
 | McKinsey Insights                      | `mckinsey.py`                 | `mckinsey.com/{insights\|capabilities\|industries}/{...}` HTML       | `free_access_copyrighted` | global            |
 | Exit Five                              | `exit_five.py`                | `exitfive.com/podcast/{slug}` HTML transcripts                       | `free_access_copyrighted` | US / global       |
-| TED — WorkLife with Adam Grant         | `ted_worklife.py`             | `ted.com/podcasts/worklife/{slug}-transcript`                        | `cc_by_nc_nd`             | US / global       |
+| TED — WorkLife with Molly Graham       | `ted_worklife.py`             | `ted.com/podcasts/{slug}-transcript` (hub: `/podcasts/worklife-transcripts`) | `cc_by_nc_nd`             | US / global       |
 | Masters of Scale                       | `masters_of_scale.py`         | `mastersofscale.com/episode/{slug}` HTML transcripts                 | `free_access_copyrighted` | US / global       |
 | People Matters                         | `people_matters.py`           | `peoplematters.in/podcast/{slug}`                                    | `free_access_copyrighted` | India / SEA       |
 | RBC Disruptors                         | `rbc_disruptors.py`           | `rbc.com/en/thought-leadership/disruptors/{slug}`                    | `free_access_copyrighted` | Canada            |
 | IMD Business School                    | `imd.py`                      | `imd.org/ibyimd/podcasts/{slug}`                                     | `free_access_copyrighted` | Switzerland       |
 | WEF Radio Davos                        | `wef_radio_davos.py`          | `weforum.org/podcasts/radio-davos/episodes/{slug}`                   | `cc_by_nc_nd`             | global            |
-| Deutsche Bank                          | `deutsche_bank.py`            | `corporates.db.com/multimedia/{slug}` + `db.com/news/detail/{slug}`  | `free_access_copyrighted` | Germany / APAC    |
+| Deutsche Bank — flow InCorporate Treasury | `deutsche_bank.py`         | `flow.db.com/media/flow-incorporatetreasury-podcasts/{slug}{,-transcript}` | `free_access_copyrighted` | Germany / APAC    |
 | UK NCSC Toolkit for Boards             | `ncsc.py`                     | `ncsc.gov.uk/information/toolkit-for-boards-audio-transcripts`       | `ogl_v3`                  | UK                |
 | Microsoft Cyber (WWPS)                 | `microsoft_cyber.py`          | `wwps.microsoft.com/{episodes,infrastructure-episodes}/{slug}` + PDF transcripts | `free_access_copyrighted` | US / global       |
-| Thomson Reuters Legal                  | `thomson_reuters.py`          | `thomsonreuters.com/en-us/posts/legal/{slug}` HTML transcripts       | `free_access_copyrighted` | US / global       |
+| Thomson Reuters Institute              | `thomson_reuters.py`          | `thomsonreuters.com/en-us/posts/{category}/podcast-{slug}` + PDF transcripts | `free_access_copyrighted` | US / global       |
 
 ## Tranche 2 — specialist overlays (2)
 
@@ -85,23 +85,21 @@ each source.
 | `people_matters`   | `sitemap.xml/podcast`      | working — 25 of 61 podcast permalinks (series *hub* pages — slugs without an embedded `/<ep-slug>` — are rejected; only true `<series>/<episode>` permalinks are admitted).                                                             |
 | `rbc_disruptors`   | `/en/thought-leadership/disruptors/` (headless) | working — 11 episode permalinks per run via Playwright. Discovery + per-episode fetch route through `BaseCrawler.fetch_rendered` because the archive page is a fully client-rendered React tree. |
 | `wef_radio_davos`  | `/podcasts/radio-davos/` (headless)             | working — 7 episode permalinks per run via Playwright. `weforum.org` returns HTTP 403 to plain `requests` GETs (WAF on TLS/JA3 + client-hint fingerprint); the headless-Chromium transport's realistic fingerprint clears the WAF. Transcripts extracted from `<div data-gtm-section="Podcast transcript">`. |
-| `deutsche_bank`    | n/a                        | **Gap — source-side**. `corporates.db.com/multimedia/podcasts` exposes 2 series hubs (`esg-insights`, `mark-to-market`) but ships **audio only** — no transcripts on the site. Headless walker can reach the page; there is nothing transcriptable to admit until Deutsche Bank publishes transcripts. |
+| `deutsche_bank`    | `flow.db.com/media/flow-incorporatetreasury-podcasts/` (HTML hub) | working — 11 episode permalinks discovered, each resolved to its `{slug}-transcript` companion page for verbatim text. The original Tranche 1 base (`corporates.db.com/multimedia/podcasts`) only hosts audio-only series; flow.db.com is the only Deutsche Bank surface that publishes transcripts. Plain `requests` GET (no headless). |
 | `mckinsey`         | n/a                        | **Gap — WAF**. `www.mckinsey.com/featured-insights/mckinsey-podcast` returns an Akamai "Access Denied" page even via headless Chromium with a realistic fingerprint, while sibling paths under `/featured-insights/` work. Akamai is path-scoped against the podcast subpath and our fingerprint is not enough to clear it. Will need a residential-egress proxy (or McKinsey allow-listing our origin) before discovery is possible. |
-| `rics`             | n/a                        | **Gap — source-side**. `rics.org/podcast` renders fully via headless browser but the episode cards link only to external audio players — **no transcripts are published on rics.org**. Crawling cleanly is impossible until RICS adds transcripts. |
-| `ted_worklife`     | n/a                        | **Gap — source-side**. The show migrated off `ted.com`: `/podcasts/worklife` now hosts only outbound links to Spotify / Apple Podcasts / Castbox / Amazon Music / Player.fm. Every episode-page URL pattern (`/podcasts/worklife-with-adam-grant`, `/podcasts/worklife-with-adam-grant/episodes`, etc.) returns TED's 404 page. **Transcripts are not hosted on ted.com.** |
-| `thomson_reuters`  | n/a                        | **Gap — source-side**. `www.thomsonreuters.com/en/insights/podcasts` and `legal.thomsonreuters.com/blog/category/podcasts/` both return Thomson Reuters' "Page not found" template. **No podcast presence located on the corporate site** after Tranche 1 reconnaissance. |
+| `rics`             | n/a                        | **Gap — source-side**. `rics.org/podcast` renders fully via headless browser but the episode cards link only to external audio players (Buzzsprout) — **no transcripts are published on rics.org**. Crawling cleanly is impossible until RICS adds transcripts. |
+| `ted_worklife`     | `/podcasts/worklife-transcripts` (HTML hub) | working — 4 episode-transcript permalinks discovered. The show rebranded from Adam Grant → Molly Graham and TED migrated the URL structure from `/podcasts/worklife/{slug}-transcript` (Tranche 1) to `/podcasts/{slug}-transcript` (now). The hub `/podcasts/worklife-transcripts` is the canonical listing under the new scheme. Plain `requests` GET (no headless). |
+| `thomson_reuters`  | `post-sitemap{1,2,3}.xml` (sitemap) | working — 25 of the 47 `podcast-*` permalinks discovered (DISCOVER_CAP). Each post embeds an "Episode transcript" PDF link under `wp-content/uploads/`; the crawler fetches the PDF for verbatim text and falls back to the post HTML when the PDF 404s (stale links on a handful of older posts). Plain `requests` GET (no headless). |
 
-The five remaining `Gap` rows split into two categories — and
-the split matters for triage:
+Two `Gap` rows remain after Milestone A2 — both are blocked on
+factors outside the codebase:
 
-* **Source-side gaps** (`deutsche_bank`, `rics`, `ted_worklife`,
-  `thomson_reuters`): the source does not publish transcripts on
-  the URLs we expected. `deutsche_bank` ships audio only;
-  `rics` links out to external audio players; `ted_worklife` and
-  `thomson_reuters` have removed their podcast presence from the
-  corporate site entirely. No technical change to the crawler
-  will close these — they're blocked on the publisher.
-* **WAF gaps** (`mckinsey`): Akamai still 403s the specific
+* **Source-side gap** (`rics`): RICS publishes audio only on
+  `rics.org/podcast`; episode cards link out to Buzzsprout for
+  playback and no transcripts are hosted on the RICS site. No
+  technical change to the crawler will close this — it's blocked
+  on the publisher.
+* **WAF gap** (`mckinsey`): Akamai still 403s the specific
   podcast subpath even with a realistic browser fingerprint.
   Closing this requires a residential-egress proxy or an explicit
   origin allow-listing by McKinsey.
@@ -109,9 +107,9 @@ the split matters for triage:
 The architecture supports both shapes — `_discover_episode_slugs`
 is there, the headless-browser transport is wired in (see
 `crawl/crawlers/_browser.py`), and the rest of the pipeline is
-publisher-agnostic. Closing the remaining gaps requires changes
-on the source side (or a different network egress for McKinsey),
-not in this codebase.
+publisher-agnostic. Closing the remaining two gaps requires
+changes on the source side (or a different network egress for
+McKinsey), not in this codebase.
 
 ## Adding a new source
 
