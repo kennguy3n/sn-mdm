@@ -773,3 +773,83 @@ def test_browser_context_rolls_back_on_partial_init_failure(
     assert state._context is None
     # And the partial Playwright handle was stopped during rollback.
     assert closed["playwright"] is True
+
+
+def test_fetch_rendered_rejects_empty_wait_for_states() -> None:
+    """An empty ``wait_for_states`` cannot drive ``page.goto`` (which
+    needs at least one ``wait_until`` value). Catching it up-front
+    surfaces a clear error instead of letting the goto-step unpack
+    raise the cryptic ``ValueError: not enough values to unpack``.
+    The type contract (``Iterable[str]``) doesn't prevent an empty
+    iterable so the guard is the only thing that does.
+    """
+    from crawl.crawlers import _browser
+
+    with pytest.raises(ValueError, match="at least one load state"):
+        _browser.fetch_rendered("https://example.com/", wait_for_states=())
+    # Tuple variants also rejected.
+    with pytest.raises(ValueError, match="at least one load state"):
+        _browser.fetch_rendered("https://example.com/", wait_for_states=[])
+
+
+def test_browser_state_does_not_register_atexit_per_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The module-level singleton registers exactly one atexit
+    handler at import time. Test instances of ``_BrowserState``
+    must NOT add their own — without this guarantee every test
+    that instantiates a state leaves a no-op handler behind,
+    inflating the registry over time.
+    """
+    import atexit as _atexit_mod
+
+    from crawl.crawlers import _browser
+
+    registered: list[Any] = []
+    monkeypatch.setattr(
+        _atexit_mod, "register", lambda fn, *a, **k: registered.append(fn) or fn
+    )
+    # Round-trip the import path so monkeypatch sees the substitution
+    # in the same atexit module ``_browser`` imported earlier.
+    _ = _browser._BrowserState()
+    _ = _browser._BrowserState()
+    _ = _browser._BrowserState()
+    # If __init__ still registered, ``registered`` would have three
+    # entries.
+    assert registered == [], (
+        "_BrowserState.__init__ unexpectedly registered an atexit handler; "
+        "registration must only happen on the module-level _STATE singleton"
+    )
+
+
+def test_wef_cookiebot_stripping_via_css_selectors(
+    wef_crawler: WefRadioDavosCrawler,
+) -> None:
+    """The CSS-selector implementation of Cookiebot stripping must
+    catch every casing variant we've observed in WEF markup
+    (``CybotCookiebotDialog``, ``CookiebotDialog``, ``CybotEdge``,
+    ``cookiebot-floating``) and leave non-Cookiebot tags alone.
+    Exercised through ``_normalize_html_bytes`` because that's the
+    actual production entry point — the stripping is one stage in
+    the body-extraction pipeline and asserting on the final string
+    catches regressions in the integration as well as the isolated
+    selector list.
+    """
+    html = (
+        b"<html><body>"
+        b'<div id="CybotCookiebotDialog">cookie banner one</div>'
+        b'<div id="CookiebotDialog">cookie banner two</div>'
+        b'<div class="CybotEdge container">cookie banner three</div>'
+        b'<div class="cookiebot-floating">cookie banner four</div>'
+        b'<div data-gtm-section="Podcast transcript">'
+        b"<p>real transcript paragraph</p>"
+        b"</div>"
+        b'<div id="unrelated">unrelated content</div>'
+        b"</body></html>"
+    )
+    text = wef_crawler._normalize_html_bytes(html)
+    assert "cookie banner one" not in text
+    assert "cookie banner two" not in text
+    assert "cookie banner three" not in text
+    assert "cookie banner four" not in text
+    assert "real transcript paragraph" in text

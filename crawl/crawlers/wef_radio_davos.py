@@ -156,22 +156,26 @@ class WefRadioDavosCrawler(BaseCrawler):
         ):
             tag.decompose()
         # Cookiebot wraps everything under ``<div id="CybotCookiebotDialog">``
-        # / ``<div class="CybotEdge ...">``. Strip both shapes. We
-        # walk a snapshot of the tree so concurrent ``.decompose``
-        # doesn't invalidate our iterator.
-        for tag in list(soup.find_all(True)):
-            if not getattr(tag, "attrs", None):
-                continue
-            tid = (tag.get("id") or "").lower()
-            tcls = " ".join(
-                c for c in (tag.get("class") or []) if isinstance(c, str)
-            ).lower()
-            if (
-                "cybot" in tid
-                or "cookiebot" in tid
-                or "cybot" in tcls
-                or "cookiebot" in tcls
-            ):
+        # / ``<div class="CybotEdge ...">``. Both variants live behind
+        # an attribute substring match, so a CSS selector lets the
+        # parser's index do the walk instead of us calling
+        # ``find_all(True)`` and inspecting every element by hand.
+        # The selectors below are case-sensitive (BeautifulSoup's
+        # ``*=`` is) so we list each casing variant Cookiebot emits.
+        # We materialise the list because ``.decompose`` mutates the
+        # tree the selector engine just walked.
+        _COOKIEBOT_SELECTORS = (
+            '[id*="Cybot"]',
+            '[id*="cybot"]',
+            '[id*="Cookiebot"]',
+            '[id*="cookiebot"]',
+            '[class*="Cybot"]',
+            '[class*="cybot"]',
+            '[class*="Cookiebot"]',
+            '[class*="cookiebot"]',
+        )
+        for selector in _COOKIEBOT_SELECTORS:
+            for tag in list(soup.select(selector)):
                 tag.decompose()
 
         # WEF emits a stable Google Tag Manager attribute on the

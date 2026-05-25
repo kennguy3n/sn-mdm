@@ -110,7 +110,20 @@ class _BrowserState:
         # stale partially-rendered snapshot — see comment in
         # ``fetch_rendered`` for why URL-alone is unsafe.
         self._cache: OrderedDict[tuple[object, ...], tuple[bytes, str]] = OrderedDict()
-        atexit.register(self._shutdown)
+        # ``atexit`` registration is deliberately *not* done here.
+        # The production singleton ``_STATE`` registers its shutdown
+        # hook at module import time (see end of this file); the
+        # test suite spins up additional ``_BrowserState`` instances
+        # to exercise cache + partial-init invariants, and we don't
+        # want each of those to attach its own no-op atexit handler
+        # (every Python process would end up with one handler per
+        # test that constructs a state).
+        #
+        # Callers who construct a state outside the singleton and
+        # actually open a browser are responsible for invoking
+        # ``_shutdown`` themselves — in practice that's only the
+        # tests, which never call ``context()`` so there's nothing
+        # to tear down.
 
     def context(self) -> BrowserContext:
         """Return a live :class:`BrowserContext`, opening Chromium
@@ -233,6 +246,11 @@ class _BrowserState:
 
 
 _STATE = _BrowserState()
+# Tie the production singleton's shutdown to interpreter exit. This
+# is the *only* call site that should register an atexit handler
+# for a ``_BrowserState`` — see the docstring inside ``__init__``
+# for why the constructor itself no longer does this.
+atexit.register(_STATE._shutdown)
 
 
 def fetch_rendered(
@@ -301,6 +319,17 @@ def fetch_rendered(
     # the partially-rendered first response and yield bytes that
     # the caller's BeautifulSoup parse can't make sense of.
     states_key = tuple(wait_for_states)
+    if not states_key:
+        # Reject empty up-front with a clear error rather than letting
+        # the unpack at the goto step raise the cryptic ``ValueError:
+        # not enough values to unpack``. ``page.goto`` needs at least
+        # one ``wait_until`` state to know when the navigation is
+        # complete — callers who genuinely want no waiting should
+        # pass ``("commit",)`` (Playwright's fastest accept).
+        raise ValueError(
+            "wait_for_states must contain at least one load state; "
+            'pass ("commit",) for the fastest accept'
+        )
     cache_key: tuple[object, ...] = (url, wait_for_selector, states_key)
     if use_cache:
         cached = _STATE.cache_get(cache_key)
