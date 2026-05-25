@@ -244,6 +244,26 @@ class Pipeline:
                 normalised = crawler.normalize(raw)
                 if normalised.content_hash in self._seen_content_hashes:
                     stats.episodes_skipped_dedup += 1
+                    # Mirror of the admit and reject paths: this
+                    # slug *was* fetched (HTTP cost already paid)
+                    # and its normalised content collided with an
+                    # already-seen ``content_hash``. The dedup
+                    # gate suppresses the metadata/chunks/
+                    # governance writes, but if the same publisher
+                    # appears twice in the ``targets`` list within
+                    # one :class:`Pipeline` lifetime, the second
+                    # invocation would otherwise re-fetch the same
+                    # slug, re-normalise to the same hash, and
+                    # re-hit dedup — a wasted HTTP request. Adding
+                    # the episode_id to the in-memory skip set
+                    # short-circuits the second fetch at the
+                    # incremental gate and (incidentally) attributes
+                    # the skip to ``episodes_skipped_incremental``
+                    # instead of ``episodes_skipped_dedup`` in the
+                    # repeat stats.
+                    self._known_ids_by_publisher.setdefault(
+                        publisher_id, set()
+                    ).add(crawler.episode_id_for_slug(raw.episode_slug))
                     continue
                 self._seen_content_hashes.add(normalised.content_hash)
                 crawler.save_raw(raw)
@@ -305,14 +325,15 @@ class Pipeline:
         The underlying ``_known_ids_by_publisher`` map is populated
         once at construction time (single pass over the governance
         log alongside ``_seen_content_hashes``) and *kept in sync*
-        as the current run admits OR rejects new episodes — see
-        :meth:`run_publisher`, which adds the episode_id in both
-        the admitted and the rights-rejected paths. This means a
-        second ``run_publisher`` call for the same publisher inside
-        one :class:`Pipeline` lifetime (e.g. duplicate entry in the
-        ``targets`` list) correctly attributes the skip to the
-        incremental counter, not the content-hash dedup counter,
-        whether the first call admitted or rejected the episode.
+        as the current run processes new episodes — see
+        :meth:`run_publisher`, which adds the episode_id in *all
+        three* terminal paths (admitted, rights-rejected, and
+        content-hash-deduped). This means a second
+        ``run_publisher`` call for the same publisher inside one
+        :class:`Pipeline` lifetime (e.g. duplicate entry in the
+        ``targets`` list) short-circuits at the incremental gate
+        — saving the wasted HTTP fetch — regardless of which gate
+        the first call ended at.
 
         Skip-set composition rules (cross-reference
         :meth:`_load_governance_state` for the boot-time source

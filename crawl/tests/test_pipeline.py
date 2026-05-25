@@ -1094,6 +1094,75 @@ def test_pipeline_in_memory_skip_set_updates_after_rights_rejection(
     crawlers._REGISTRY.pop("fake", None)
 
 
+def test_pipeline_in_memory_skip_set_updates_after_dedup(
+    tmp_path: Path,
+) -> None:
+    """Regression for round-7 ANALYSIS_0002: episodes content-hash-
+    deduped during the current ``run_publisher`` call must also
+    land in ``_known_ids_by_publisher`` so a second invocation for
+    the same publisher in the same :class:`Pipeline` lifetime
+    short-circuits at the incremental gate rather than paying for
+    another HTTP fetch + normalisation just to re-discover the
+    collision.
+
+    The fixture is a ``FakeCrawler`` subclass that yields two
+    episodes with different slugs but whose ``normalize`` produces
+    identical canonical text (and therefore identical
+    ``content_hash``). The first episode admits, the second hits
+    the dedup gate. Both episode_ids must end up in the
+    in-memory skip set.
+    """
+    from crawl import crawlers
+
+    class TwinSlugDedupCrawler(FakeCrawler):
+        """Yields two RawEpisodes with distinct slugs. The
+        inherited ``normalize`` returns a fixed body, so both
+        episodes hash to the same ``content_hash`` and the second
+        one collides with the first.
+        """
+
+        def initial_sync(self):
+            yield RawEpisode(
+                episode_slug="twin-a",
+                title="Twin A",
+                primary_url="https://example.com/episodes/twin-a",
+                publication_date="2024-01-01",
+                raw_bytes=b"<html><body>a</body></html>",
+                content_type="text/html",
+                hosts=["Simon"],
+            )
+            yield RawEpisode(
+                episode_slug="twin-b",
+                title="Twin B",
+                primary_url="https://example.com/episodes/twin-b",
+                publication_date="2024-01-02",
+                raw_bytes=b"<html><body>b</body></html>",
+                content_type="text/html",
+                hosts=["Simon"],
+            )
+
+    crawlers._REGISTRY["fake"] = TwinSlugDedupCrawler  # type: ignore[attr-defined]
+    try:
+        pipeline = Pipeline(
+            configs={"fake": _config()},
+            packs_root=tmp_path,
+            incremental=True,
+        )
+        first = pipeline.run_publisher("fake")
+        assert first.episodes_admitted == 1
+        assert first.episodes_skipped_dedup == 1
+        assert first.episodes_skipped_incremental == 0
+        # Both the admitted slug AND the deduped slug must be in
+        # the in-memory skip set — otherwise a repeat invocation
+        # would re-fetch the deduped slug just to re-hit dedup.
+        assert pipeline._known_ids_by_publisher["fake"] == {
+            "fake_flagship_twin-a",
+            "fake_flagship_twin-b",
+        }
+    finally:
+        crawlers._REGISTRY.pop("fake", None)
+
+
 def test_incremental_sync_log_line_uses_incremental_prefix(
     tmp_path: Path, caplog
 ) -> None:
