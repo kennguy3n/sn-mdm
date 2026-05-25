@@ -671,9 +671,11 @@ def test_pipeline_load_known_episode_ids_groups_by_publisher_prefix(
     field (written before the round-3 review) must still be
     partitioned correctly by the prefix-matching fallback. Each
     crawler must see only its own admitted set, deprecated rows
-    must be excluded so a future re-crawl under a different
-    rights code can still admit them, and a publisher with no
-    config must not bleed into the fake publisher's skip set.
+    whose rights_code is *still* outside the allowlist must land
+    in the skip set (so persistently-rejected episodes don't get
+    re-fetched on every run — see round-5 ANALYSIS_0004), and a
+    publisher with no config must not bleed into the fake
+    publisher's skip set.
     """
     _register_fake()
     gov = tmp_path / "governance" / "rights_log.jsonl"
@@ -697,8 +699,12 @@ def test_pipeline_load_known_episode_ids_groups_by_publisher_prefix(
                     "deprecated": False,
                 },
                 {
-                    # Deprecated row — must NOT land in the skip set.
-                    "episode_id": "fake_flagship_ep3-rejected",
+                    # Deprecated row whose ``rights_code`` is still
+                    # outside the current allowlist — must land in
+                    # the skip set so ``--incremental`` does NOT
+                    # re-fetch + re-reject + re-append on every run
+                    # (steady-state log-growth failure mode).
+                    "episode_id": "fake_flagship_ep3-still-rejected",
                     "rights_code": "paywalled",
                     "ingestion_date": 1700000002,
                     "content_hash": "h3",
@@ -724,13 +730,110 @@ def test_pipeline_load_known_episode_ids_groups_by_publisher_prefix(
     )
     known = pipeline._known_ids_for("fake")
     assert known == frozenset(
-        {"fake_flagship_ep1", "fake_flagship_ep2"}
+        {
+            "fake_flagship_ep1",
+            "fake_flagship_ep2",
+            "fake_flagship_ep3-still-rejected",
+        }
     )
     # An unknown publisher (no config) returns an empty set
     # rather than raising — defensive against a registry reshuffle
     # that removes a publisher while the governance log still has
     # its history.
     assert pipeline._known_ids_for("otherpub") == frozenset()
+
+
+def test_pipeline_deprecated_entry_skips_when_rights_still_rejected(
+    tmp_path: Path,
+) -> None:
+    """A rights-rejected episode whose ``rights_code`` is still
+    outside the current allowlist must NOT be re-fetched on the
+    next ``--incremental`` run. This is the architecturally
+    correct fix for round-5 ANALYSIS_0004: without it, every run
+    re-fetches every persistently-rejected episode and appends
+    another deprecated governance entry, producing unbounded log
+    growth and pointless HTTP cost.
+
+    The fix is policy-aware: if the operator later extends
+    ``rights_allowlist`` to include the recorded code, the entry
+    falls back out of the skip set on the next boot (see
+    ``test_pipeline_deprecated_entry_rechecks_when_rights_now_allowed``).
+    """
+    _register_fake()
+    gov = tmp_path / "governance" / "rights_log.jsonl"
+    gov.parent.mkdir(parents=True, exist_ok=True)
+    gov.write_text(
+        json.dumps(
+            {
+                "publisher_id": "fake",
+                "episode_id": "fake_flagship_paywalled-ep",
+                "rights_code": "paywalled",
+                "ingestion_date": 1700000000,
+                "content_hash": "hash-of-rejected-content",
+                "deprecated": True,
+            }
+        )
+        + "\n"
+    )
+    pipeline = Pipeline(
+        configs={"fake": _config()},
+        packs_root=tmp_path,
+        incremental=True,
+    )
+    known = pipeline._known_ids_for("fake")
+    assert known == frozenset({"fake_flagship_paywalled-ep"})
+    # The rejected content_hash must NOT be carried into the
+    # dedup gate: if the operator extends the allowlist on a
+    # future boot, the legitimate re-admission must not be
+    # silently absorbed by content-hash dedup.
+    assert "hash-of-rejected-content" not in pipeline._seen_content_hashes
+
+
+def test_pipeline_deprecated_entry_rechecks_when_rights_now_allowed(
+    tmp_path: Path,
+) -> None:
+    """A rights-rejected episode whose ``rights_code`` is NOW in
+    the current allowlist (operator extended the allowlist
+    between runs) must NOT be in the skip set — the incremental
+    crawl must re-fetch so the rights gate can re-evaluate and
+    admit. Otherwise a policy change would silently leave
+    historically-rejected episodes stuck out of the pack.
+    """
+    _register_fake()
+    gov = tmp_path / "governance" / "rights_log.jsonl"
+    gov.parent.mkdir(parents=True, exist_ok=True)
+    # Rights code that the operator has now decided to allow.
+    now_allowed_code = "newly_allowed_for_test"
+    gov.write_text(
+        json.dumps(
+            {
+                "publisher_id": "fake",
+                "episode_id": "fake_flagship_previously-rejected",
+                "rights_code": now_allowed_code,
+                "ingestion_date": 1700000000,
+                "content_hash": "hash-of-then-rejected-content",
+                "deprecated": True,
+            }
+        )
+        + "\n"
+    )
+    pipeline = Pipeline(
+        configs={"fake": _config()},
+        packs_root=tmp_path,
+        rights_allowlist=(*DEFAULT_RIGHTS_ALLOWLIST, now_allowed_code),
+        incremental=True,
+    )
+    known = pipeline._known_ids_for("fake")
+    assert known == frozenset(), (
+        "deprecated entries whose rights_code is now in the "
+        "allowlist must NOT be skipped — the crawler must "
+        "re-fetch so the rights gate can re-admit."
+    )
+    # Content-hash dedup must also not block the re-admit.
+    assert (
+        "hash-of-then-rejected-content"
+        not in pipeline._seen_content_hashes
+    )
 
 
 def test_pipeline_load_known_episode_ids_prefers_explicit_publisher_id(

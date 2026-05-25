@@ -369,6 +369,24 @@ class Pipeline:
         force a re-fetch of the same content), but a future
         latest-wins semantics would need to track the *last* row
         per episode_id rather than the *first* match.
+
+        Deprecated-row gating: a deprecated row records that the
+        episode was *fetched and then rejected* by the rights gate
+        under a particular ``rights_code``. We add that episode_id
+        to the incremental skip set IFF the recorded ``rights_code``
+        is still outside the current ``rights_allowlist``. This
+        avoids the steady-state failure mode where every
+        ``--incremental`` run re-fetches every persistently-
+        rejected episode and appends another deprecated row,
+        producing unbounded log growth and pointless HTTP cost
+        proportional to the number of rejected episodes. If the
+        operator later extends the allowlist to include the
+        recorded code, the ``still_rejected`` check flips to
+        ``False`` and the id falls out of the skip set on the next
+        boot, allowing the re-fetch + re-admission. The
+        ``content_hash`` is never carried forward for deprecated
+        rows, so the dedup gate never suppresses that legitimate
+        re-admission.
         """
         gov = self.packs_root / "governance" / "rights_log.jsonl"
         if not gov.exists():
@@ -408,17 +426,49 @@ class Pipeline:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("deprecated"):
-                    # Don't carry rejection hashes or ids forward
-                    # — a re-crawl could later succeed under a
-                    # different rights code.
-                    continue
-                ch = rec.get("content_hash")
-                if isinstance(ch, str) and ch:
-                    self._seen_content_hashes.add(ch)
                 ep_id = rec.get("episode_id")
-                if not isinstance(ep_id, str) or not ep_id:
-                    continue
+                ep_id_valid = isinstance(ep_id, str) and bool(ep_id)
+                is_deprecated = bool(rec.get("deprecated"))
+                if is_deprecated:
+                    # A previously-rejected episode. We never carry
+                    # the ``content_hash`` forward (a re-crawl might
+                    # legitimately encounter different content), but
+                    # we *do* want to add the ``episode_id`` to the
+                    # incremental skip set IF the rights_code that
+                    # caused the rejection is still outside the
+                    # current allowlist. Otherwise every
+                    # ``--incremental`` run would re-fetch the
+                    # known-rejected slug, re-evaluate the rights
+                    # gate against the same code, and append yet
+                    # another deprecated row — producing unbounded
+                    # governance-log growth and pointless HTTP cost
+                    # for persistently-rejected episodes.
+                    #
+                    # If the operator later extends
+                    # ``rights_allowlist`` to include the rejected
+                    # code, that change is what makes the entry
+                    # eligible for re-admission: the
+                    # ``still_rejected`` check below flips to
+                    # ``False`` on the next boot, the id is no
+                    # longer added to the skip set, and the
+                    # incremental crawl picks up the episode again
+                    # and emits a fresh non-deprecated governance
+                    # entry. The dedup gate has the recorded
+                    # ``content_hash`` (we never loaded it), so the
+                    # re-admit is not suppressed.
+                    rejected_code = rec.get("rights_code")
+                    still_rejected = (
+                        isinstance(rejected_code, str)
+                        and rejected_code.lower() not in self.rights_allowlist
+                    )
+                    if not (still_rejected and ep_id_valid):
+                        continue
+                else:
+                    ch = rec.get("content_hash")
+                    if isinstance(ch, str) and ch:
+                        self._seen_content_hashes.add(ch)
+                    if not ep_id_valid:
+                        continue
                 # Prefer the explicit ``publisher_id`` field if
                 # present (entries written by
                 # ``emit_governance_entry`` post the round-3
