@@ -1,0 +1,62 @@
+[package]
+name = "pack_napi"
+version.workspace = true
+edition.workspace = true
+# napi-rs 3.x requires rustc 1.88+; the workspace MSRV (1.85) stays
+# the floor for ``pack_core`` and the Python pipeline. The MSRV CI
+# job at .github/workflows/ci.yml excludes ``pack_napi`` so the
+# meaningful signal — "can pack_core compile on the documented
+# MSRV?" — is preserved while the napi crate uses the modern
+# napi-rs release. Mirrors the rust-version split used by
+# kennguy3n/knowledge between its ``napi_addon`` crate (1.88) and
+# the rest of the substrate (1.85).
+rust-version = "1.88"
+license.workspace = true
+repository.workspace = true
+description = "Node.js native addon bridging the pack_core Rust core to JS consumers (Electron, Node CLI tooling). Built by napi-rs from this crate."
+
+# Dual crate-type:
+#
+# * ``cdylib`` — the artefact that ``napi build`` packages as a
+#   ``.node`` file and the Node loader resolves via ``require()``.
+# * ``rlib`` — re-exposes the same module from Rust so unit tests
+#   in this crate exercise the pure-Rust facade directly without
+#   going through the Node bridge, matching the pattern in
+#   kennguy3n/knowledge's ``napi_addon``.
+#
+# Both are produced from a single ``cargo build``.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pack_core = { path = "../pack_core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+
+# Real N-API bindings via napi-rs (https://napi.rs/).
+#
+# Feature mix:
+# * ``napi6`` — opt into APIs available on Node 10.20+; covers
+#   every currently-supported LTS line.
+# * ``serde-json`` — adds ``FromNapiValue`` / ``ToNapiValue`` impls
+#   for ``serde_json::Value`` so the bridge can accept arbitrarily-
+#   shaped JS objects without hand-rolling marshalling for every
+#   argument struct.
+# * ``dyn-symbols`` — resolve ``napi_*`` C symbols at runtime
+#   through ``libloading::Library::this()`` rather than at link
+#   time. This is what lets ``cargo test -p pack_napi`` build the
+#   test binary when no Node host is providing the symbols; the
+#   production ``.node`` artefact has them resolved from the
+#   embedding ``node`` process at load time.
+napi = { version = "3", default-features = false, features = ["napi6", "serde-json", "dyn-symbols"] }
+napi-derive = "3"
+
+[build-dependencies]
+# Emits the platform-specific linker directives (``/EXPORT`` on
+# Windows, ``-undefined dynamic_lookup`` on macOS, no-op on Linux)
+# that the Node loader needs to dlopen the ``.node`` file. See
+# <https://napi.rs/docs/cli/build>.
+napi-build = "2"

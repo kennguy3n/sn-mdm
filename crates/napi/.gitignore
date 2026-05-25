@@ -1,0 +1,10 @@
+# napi-rs build artefacts. Generated at `npm run build` time.
+# These ship in published npm tarballs but are not committed to git
+# so the repo stays slim and platform-agnostic.
+*.node
+index.js
+index.d.ts
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

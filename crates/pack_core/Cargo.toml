@@ -11,6 +11,10 @@ description = "Pack format, SQLCipher+FTS5 index, multi-lane search, and compact
 name = "pack-build"
 path = "src/bin/pack_build.rs"
 
+[[bin]]
+name = "pack-search"
+path = "src/bin/pack_search.rs"
+
 [dependencies]
 thiserror.workspace = true
 anyhow.workspace = true
