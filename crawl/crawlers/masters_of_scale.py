@@ -73,28 +73,67 @@ class MastersOfScaleCrawler(BaseCrawler):
         )
 
     def _normalize_html_bytes(self, raw_bytes: bytes) -> str:
+        """Lift the verbatim transcript out of the Masters of Scale page.
+
+        MoS pages introduce the transcript with an ``<h2>`` whose
+        text starts with ``Transcript:``. The original Tranche-1
+        implementation walked ``target.next_siblings`` to collect
+        the transcript paragraphs — but the heading is nested
+        inside a sticky wrapper ``<div class="flex md:block …">``
+        that holds an "Open / Close" chevron toggle. The only
+        direct sibling of the heading inside that wrapper is the
+        chevron-toggle ``<div>``; the actual ``<p>`` paragraphs of
+        the transcript are siblings of that wrapper, one level
+        up. The previous behaviour therefore extracted exactly the
+        chevron-toggle text ("Open chevron-down Close chevron-up")
+        — identical across every episode page — and the content-
+        hash dedup gate folded 24 of the 25 discovered episodes
+        into one admitted row.
+
+        The architecturally correct walk is :meth:`find_all_next`,
+        which descends the entire forward DOM from the heading,
+        capturing every ``<p>``, ``<li>`` and ``<blockquote>``
+        regardless of which wrapper ``<div>`` they sit inside.
+        We stop at the next top-level heading (``h1``/``h2``); on
+        MoS pages there's no such heading after the transcript,
+        so the walk runs to end-of-(content-)DOM. The ``nav`` /
+        ``footer`` / ``header`` / ``iframe`` / ``script`` strip
+        already ran above, so trailing site-chrome paragraphs
+        ("Sign up for the newsletter…") aren't in scope.
+
+        Episodes published before MoS started shipping
+        transcripts return an empty string from this method.
+        ``_collapse_blank_lines("")`` is the empty string, every
+        such episode therefore lands in the same dedup bucket
+        instead of polluting the catalogue with one "header-only"
+        row per audio-only show — which is what we want.
+        """
         soup = BeautifulSoup(raw_bytes, "lxml")
         for tag in soup(["script", "style", "noscript", "iframe", "nav", "footer", "header"]):
             tag.decompose()
-        # Match a heading whose text contains "Transcript" and collect siblings.
+        # Only headings that *start with* the word "Transcript"
+        # qualify — bare ``"transcript" in text.lower()`` would
+        # also match titles like "An older episode without a
+        # transcript", which is the wrong anchor and would emit
+        # the page chrome as a "transcript" for audio-only shows.
         target = None
         for h in soup.find_all(re.compile(r"^h[1-6]$")):
-            if "transcript" in h.get_text(" ", strip=True).lower():
+            text = h.get_text(" ", strip=True).lower()
+            if re.match(r"^transcript\b", text):
                 target = h
                 break
         if target is None:
-            container = soup.find("article") or soup
-        else:
-            container = soup.new_tag("div")
-            for sib in list(target.next_siblings):
-                if getattr(sib, "name", None) and re.match(r"^h[1-2]$", sib.name):
-                    break
-                if hasattr(sib, "extract"):
-                    container.append(sib.extract())
-        for level in range(1, 7):
-            for h in container.find_all(f"h{level}"):
-                h.replace_with(f"\n{'#' * level} {h.get_text(strip=True)}\n")
-        return _collapse_blank_lines(container.get_text("\n"))
+            return ""
+        paragraphs: list[str] = []
+        for sib in target.find_all_next():
+            name = getattr(sib, "name", None)
+            if name and re.match(r"^h[1-2]$", name):
+                break
+            if name in ("p", "li", "blockquote"):
+                text = sib.get_text(" ", strip=True)
+                if text:
+                    paragraphs.append(text)
+        return _collapse_blank_lines("\n\n".join(paragraphs))
 
 
 def _meta_description(soup: BeautifulSoup) -> str:

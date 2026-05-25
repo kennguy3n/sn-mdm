@@ -95,10 +95,36 @@ class ImdCrawler(BaseCrawler):
         )
 
     def _normalize_html_bytes(self, raw_bytes: bytes) -> str:
+        """Lift the canonical episode body out of IMD's Elementor layout.
+
+        IMD wraps the post body in
+        ``<div data-elementor-type="wp-post">``, but the same
+        template also ships several ``<article>`` blocks for the
+        "Related Articles" sidebar widget that render *outside*
+        the wp-post container at the top of the DOM. The original
+        Tranche-1 implementation picked ``soup.find("article")``,
+        which selects the first ``<article>``; that's the related-
+        cards widget, not the episode body. Every episode page
+        on the site renders the same recent-articles list there,
+        so the extracted text was effectively identical across
+        every episode — the content-hash dedup gate then folded
+        22 of the 25 discovered episodes into one row.
+
+        Pinning to ``data-elementor-type="wp-post"`` is the
+        canonical fix: that attribute is Elementor's marker for
+        the post-content wrapper and the only one IMD renders per
+        page. We additionally drop nested ``<article>`` blocks
+        (the in-body "you might also like" widget) so a future
+        Elementor layout change can't re-introduce the same
+        cross-episode chrome leak.
+        """
         soup = BeautifulSoup(raw_bytes, "lxml")
         for tag in soup(["script", "style", "noscript", "iframe", "nav", "footer", "header"]):
             tag.decompose()
-        container = soup.find("article") or soup
+        post = soup.find("div", attrs={"data-elementor-type": "wp-post"})
+        container = post or soup
+        for art in container.find_all("article"):
+            art.decompose()
         for level in range(1, 7):
             for h in container.find_all(f"h{level}"):
                 h.replace_with(f"\n{'#' * level} {h.get_text(strip=True)}\n")
