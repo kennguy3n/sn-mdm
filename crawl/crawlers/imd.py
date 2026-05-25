@@ -4,8 +4,13 @@ IMD publishes podcasts under
 ``https://www.imd.org/ibyimd/podcasts/{slug}`` (the public
 permalink). The ``/ibyimd/category/podcasts/`` index page lists
 every episode and we walk that to enumerate slugs. The site
-follows a standard WordPress layout — body text inside
-``<article>``, header inside ``<header>``.
+runs on WordPress with the Elementor page builder: the post
+body lives inside ``<div data-elementor-type="wp-post">`` and
+several related-articles ``<article class="card">`` widgets are
+rendered as siblings of (and inside) that container. See
+:meth:`ImdCrawler._normalize_html_bytes` for the extraction
+strategy that pins to the Elementor marker and strips the
+``article.card`` widgets in the fallback path.
 
 Some episodes live under a series prefix like
 ``ibyimd/podcasts/leaders-unplugged/<slug>``. The discovery
