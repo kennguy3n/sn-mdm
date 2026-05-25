@@ -33,7 +33,14 @@ use pack_core::{PackBuilder, PackStore};
 
 fn main() -> ExitCode {
     let args = match parse_args() {
-        Ok(a) => a,
+        // Help is its own outcome rather than a ``process::exit``
+        // from inside the parser — see the comment on
+        // [`ParseOutcome`] for why.
+        Ok(ParseOutcome::Help) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(ParseOutcome::Args(a)) => a,
         Err(msg) => {
             eprintln!("pack-build: {msg}\n\n{USAGE}");
             return ExitCode::from(2);
@@ -142,7 +149,20 @@ struct Args {
     notes: Option<String>,
 }
 
-fn parse_args() -> Result<Args, String> {
+/// Outcome of [`parse_args`]. ``--help`` is its own variant so the
+/// parser never calls [`std::process::exit`] inside a function that
+/// could in principle be unit-tested. Mirrors the same pattern in
+/// [`pack_search`](crate::bin::pack_search).
+#[derive(Debug)]
+enum ParseOutcome {
+    /// Parsed flags ready to execute.
+    Args(Args),
+    /// ``--help`` / ``-h`` requested. ``main`` prints [`USAGE`] and
+    /// exits ``0``.
+    Help,
+}
+
+fn parse_args() -> Result<ParseOutcome, String> {
     // Hand-rolled flag parser. We deliberately avoid a `clap`
     // dependency for the CLI — keeping pack_core's runtime
     // dependency footprint as small as the spec calls for. The
@@ -165,17 +185,19 @@ fn parse_args() -> Result<Args, String> {
                 notes = Some(argv.next().ok_or("--notes needs a value")?);
             }
             "-h" | "--help" => {
-                println!("{USAGE}");
-                std::process::exit(0);
+                // Do NOT ``std::process::exit`` here — keep
+                // ``parse_args`` a pure function so it stays
+                // testable. ``main`` handles the print + exit.
+                return Ok(ParseOutcome::Help);
             }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    Ok(Args {
+    Ok(ParseOutcome::Args(Args {
         packs_root: packs_root.ok_or("--packs-root is required")?,
         output: output.ok_or("--output is required")?,
         notes,
-    })
+    }))
 }
 
 const USAGE: &str = "Usage: pack-build --packs-root <DIR> --output <FILE> [--notes <STR>]

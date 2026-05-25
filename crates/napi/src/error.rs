@@ -27,9 +27,20 @@ pub type NapiResult<T> = std::result::Result<T, NapiError>;
 ///   encoding of a result struct). Tagged ``Internal`` so host
 ///   telemetry can distinguish "caller bug" from "substrate bug"
 ///   without pattern-matching on opaque strings.
+/// * [`NapiError::Io`] — filesystem error originating from the
+///   substrate itself (e.g. tempdir creation in [`super::open_pack`]),
+///   **not** from a ``pack_core`` call. Kept distinct from
+///   [`NapiError::Pack`] so telemetry can tell apart "the substrate
+///   could not stage a tempdir" from "the pack content was bad" —
+///   the two have different remediation paths (transient OS issue
+///   vs. corrupt input).
 /// * [`NapiError::Pack`] — forwarded error from
 ///   [`pack_core::PackError`]. The wrapper preserves the original
 ///   message and stamps its finer-grained ``kind`` on the wire.
+///   A wrapped [`pack_core::PackError::Io`] still surfaces here with
+///   ``kind = "Io"`` because the IO failed inside pack_core's own
+///   plumbing — the ``variant`` tag (``Pack`` vs ``Io``) carries
+///   the source-of-error provenance.
 /// ## Wire shape
 ///
 /// Serialised via ``#[serde(tag = "variant", content = "data")]`` so
@@ -58,6 +69,22 @@ pub enum NapiError {
         message: String,
     },
 
+    /// Filesystem error originating from the substrate — distinct
+    /// from [`NapiError::Pack`] because the IO failed inside the
+    /// bridge's own staging code (tempdir creation, extract path)
+    /// rather than inside a ``pack_core`` call. The wire ``kind`` is
+    /// still ``"Io"`` so JS callers can match a single tag for
+    /// "any filesystem problem", and the ``variant`` discriminant
+    /// in ``detail`` (``"Io"`` here, ``"Pack"`` if it came from
+    /// pack_core) reveals which side of the bridge the error
+    /// originated on.
+    #[error("io: {message}")]
+    Io {
+        /// Original [`std::fmt::Display`] text from the
+        /// [`std::io::Error`].
+        message: String,
+    },
+
     /// Forwarded error from the underlying [`pack_core`] surface.
     /// Carries the [`pack_core::PackError`] message string —
     /// [`pack_core::PackError`] itself is not ``Serialize``, so we
@@ -80,10 +107,15 @@ impl NapiError {
     /// [`NapiError::Pack`] sub-tag so host code can ``switch`` on
     /// ``"BadMagic"`` / ``"ChecksumMismatch"`` / ... directly
     /// instead of having to unwrap a generic ``"Pack"`` envelope.
+    /// [`NapiError::Io`] surfaces as the literal ``"Io"`` tag, the
+    /// same tag a ``pack_core``-originated IO error carries via the
+    /// ``Pack`` variant — JS hosts that only care "is this a
+    /// filesystem problem?" can switch on a single string.
     pub fn kind(&self) -> &str {
         match self {
             Self::InvalidArgument { .. } => "InvalidArgument",
             Self::Internal { .. } => "Internal",
+            Self::Io { .. } => "Io",
             Self::Pack { kind, .. } => kind.as_str(),
         }
     }
@@ -100,8 +132,13 @@ impl From<pack_core::PackError> for NapiError {
 
 impl From<std::io::Error> for NapiError {
     fn from(value: std::io::Error) -> Self {
-        Self::Pack {
-            kind: "Io".to_string(),
+        // Substrate-side IO (tempdir creation, extract path) is
+        // its own variant so telemetry can tell "the OS couldn't
+        // stage a temp file" from "the pack content was bad".
+        // A pack_core IO error is wrapped via the
+        // [`From<pack_core::PackError>`] impl above instead, which
+        // routes through the ``Pack`` variant with ``kind = "Io"``.
+        Self::Io {
             message: value.to_string(),
         }
     }
@@ -184,8 +221,43 @@ mod tests {
 
     #[test]
     fn io_forwards_io_kind() {
+        // ``std::io::Error`` -> ``NapiError::Io`` (substrate-side IO).
         let err: NapiError =
             std::io::Error::new(std::io::ErrorKind::NotFound, "missing pack file").into();
+        assert_eq!(err.kind(), "Io");
+        // ``variant`` discriminant is the new ``Io`` variant, not
+        // ``Pack`` — so JS callers walking ``detail.variant`` for
+        // source-of-error provenance see the right side of the
+        // bridge.
+        let v: serde_json::Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["variant"], "Io");
+        assert_eq!(v["data"]["message"], "missing pack file");
+    }
+
+    #[test]
+    fn pack_core_io_still_routes_through_pack_variant() {
+        // A ``pack_core::PackError::Io`` is still a ``Pack``
+        // envelope (the IO failed inside pack_core, not in the
+        // substrate). The ``kind`` tag is the same ``"Io"`` so
+        // single-tag JS handlers keep working, but the ``variant``
+        // discriminant differs so detailed handlers can route
+        // by source-of-error.
+        let inner = std::io::Error::other("sqlite vfs failed");
+        let err: NapiError = pack_core::PackError::Io(inner).into();
+        assert_eq!(err.kind(), "Io");
+        let v: serde_json::Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["variant"], "Pack");
+        assert_eq!(v["data"]["kind"], "Io");
+    }
+
+    #[test]
+    fn io_round_trips() {
+        let err = NapiError::Io {
+            message: "could not stage tempdir".into(),
+        };
+        let s = serde_json::to_string(&err).unwrap();
+        let back: NapiError = serde_json::from_str(&s).unwrap();
+        assert_eq!(err, back);
         assert_eq!(err.kind(), "Io");
     }
 

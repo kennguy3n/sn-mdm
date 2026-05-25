@@ -60,7 +60,14 @@ use pack_core::{
 
 fn main() -> ExitCode {
     let args = match parse_args() {
-        Ok(a) => a,
+        // Help is its own outcome rather than a ``process::exit``
+        // from inside the parser — see the comment on
+        // [`ParseOutcome`] for why.
+        Ok(ParseOutcome::Help) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(ParseOutcome::Args(a)) => a,
         Err(msg) => {
             eprintln!("pack-search: {msg}\n\n{USAGE}");
             return ExitCode::from(1);
@@ -227,8 +234,23 @@ struct Args {
     format: OutputFormat,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args() -> Result<ParseOutcome, String> {
     parse_argv(std::env::args().skip(1))
+}
+
+/// Outcome of [`parse_argv`]. ``--help`` is its own variant so the
+/// testable parser never calls [`std::process::exit`] from inside a
+/// pure function — a test that ever exercises ``--help`` would
+/// otherwise terminate the whole ``cargo test`` process. The
+/// terminal print + exit decision is moved up to [`main`] where the
+/// rest of the process-control machinery already lives.
+#[derive(Debug)]
+enum ParseOutcome {
+    /// Parsed flags ready to execute.
+    Args(Args),
+    /// ``--help`` / ``-h`` requested. ``main`` prints [`USAGE`] and
+    /// exits ``0``.
+    Help,
 }
 
 /// Real parser; split out from [`parse_args`] so unit tests can
@@ -236,7 +258,7 @@ fn parse_args() -> Result<Args, String> {
 /// the global ``std::env::args()`` state. Generic over the iterator
 /// element type so tests can pass ``Vec<&'static str>`` without an
 /// extra ``.to_string()`` on every literal.
-fn parse_argv<I, S>(argv: I) -> Result<Args, String>
+fn parse_argv<I, S>(argv: I) -> Result<ParseOutcome, String>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
@@ -300,8 +322,12 @@ where
                 };
             }
             "--help" | "-h" => {
-                println!("{USAGE}");
-                std::process::exit(0);
+                // Do NOT ``std::process::exit`` here — ``parse_argv``
+                // is a pure testable function and an exit call from
+                // inside it would terminate the test process. The
+                // caller ([`main`]) handles the print-and-exit
+                // decision based on this variant.
+                return Ok(ParseOutcome::Help);
             }
             other => return Err(format!("unknown flag {other:?}")),
         }
@@ -313,13 +339,13 @@ where
                 .into(),
         );
     }
-    Ok(Args {
+    Ok(ParseOutcome::Args(Args {
         pack,
         query,
         tags,
         limit,
         format,
-    })
+    }))
 }
 
 fn value(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -365,6 +391,38 @@ Exit codes:
 mod tests {
     use super::*;
 
+    /// Test ergonomics: unwrap a [`ParseOutcome::Args`] or panic
+    /// with a useful message. Tests that need to assert on the
+    /// ``--help`` path use [`parse_argv`] directly and match on
+    /// [`ParseOutcome::Help`].
+    fn parsed<I, S>(argv: I) -> Result<Args, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        match parse_argv(argv)? {
+            ParseOutcome::Args(a) => Ok(a),
+            ParseOutcome::Help => panic!("unexpected --help outcome in this test"),
+        }
+    }
+
+    #[test]
+    fn parse_argv_help_returns_help_outcome_does_not_exit_process() {
+        // The original implementation called ``std::process::exit(0)``
+        // from inside ``parse_argv``, which would have terminated
+        // ``cargo test`` if any test ever fed ``--help`` through.
+        // We now surface help as a distinct ``ParseOutcome`` so the
+        // pure parser is genuinely pure, and ``main`` does the
+        // print + exit. This test pins that contract for both
+        // ``--help`` and the short ``-h`` alias.
+        for flag in ["--help", "-h"] {
+            match parse_argv([flag]).expect("--help must not be an error") {
+                ParseOutcome::Help => {}
+                ParseOutcome::Args(_) => panic!("{flag} should return Help, not Args"),
+            }
+        }
+    }
+
     #[test]
     fn parse_argv_rejects_whitespace_only_query() {
         // A whitespace-only ``--query`` value is almost always a
@@ -374,7 +432,7 @@ mod tests {
         // confusing silent-failure mode. The CLI now rejects it
         // up-front with an actionable message.
         for raw in ["", " ", "\t", "  \n  ", "\t \r\n"] {
-            let err = parse_argv(["--pack", "/tmp/x.pack", "--query", raw])
+            let err = parsed(["--pack", "/tmp/x.pack", "--query", raw])
                 .expect_err(&format!("whitespace-only query {raw:?} should be rejected"));
             assert!(
                 err.contains("empty or whitespace-only"),
@@ -390,7 +448,7 @@ mod tests {
         // where user_input has surrounding spaces). The parser
         // normalises by trimming so the FTS lane sees the same
         // text regardless of how the caller quoted it.
-        let args = parse_argv(["--pack", "/tmp/x.pack", "--query", "  supply chain  "])
+        let args = parsed(["--pack", "/tmp/x.pack", "--query", "  supply chain  "])
             .expect("padded query should be accepted after trim");
         assert_eq!(args.query.as_deref(), Some("supply chain"));
     }
@@ -403,7 +461,7 @@ mod tests {
         // ``--tags-*`` family. Omitting both is a guaranteed
         // empty result, so we reject it up-front rather than
         // burn a tempdir + decompression + SQLite open on it.
-        let err = parse_argv(["--pack", "/tmp/x.pack"])
+        let err = parsed(["--pack", "/tmp/x.pack"])
             .expect_err("must reject when neither --query nor --tags-* supplied");
         assert!(
             err.contains("at least one of --query or --tags-*"),
@@ -418,7 +476,7 @@ mod tests {
         // structured-match lane in isolation. The validation must
         // not require ``--query`` when at least one ``--tags-*``
         // family is supplied.
-        let args = parse_argv([
+        let args = parsed([
             "--pack",
             "/tmp/x.pack",
             "--tags-industry",
