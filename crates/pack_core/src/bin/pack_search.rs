@@ -228,16 +228,50 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_argv(std::env::args().skip(1))
+}
+
+/// Real parser; split out from [`parse_args`] so unit tests can
+/// drive it with a fabricated iterator rather than tinkering with
+/// the global ``std::env::args()`` state. Generic over the iterator
+/// element type so tests can pass ``Vec<&'static str>`` without an
+/// extra ``.to_string()`` on every literal.
+fn parse_argv<I, S>(argv: I) -> Result<Args, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut pack: Option<PathBuf> = None;
     let mut query: Option<String> = None;
     let mut tags = TagFilter::default();
     let mut limit: usize = 10;
     let mut format = OutputFormat::Json;
-    let mut argv = std::env::args().skip(1);
+    let mut argv = argv.into_iter().map(Into::into);
     while let Some(flag) = argv.next() {
         match flag.as_str() {
             "--pack" => pack = Some(PathBuf::from(value(&mut argv, &flag)?)),
-            "--query" => query = Some(value(&mut argv, &flag)?),
+            "--query" => {
+                // Reject whitespace-only ``--query "   "`` early
+                // rather than letting it slip through and silently
+                // produce a zero-hit result downstream (the FTS lane
+                // skips on ``query.text.trim().is_empty()`` in
+                // search.rs). A pure-whitespace query is almost
+                // certainly a shell mistake — a stray quote or an
+                // unset variable expanding to nothing — and the
+                // caller is better served by a loud error than a
+                // surprise empty result with exit code 0. Storing
+                // the trimmed value also normalises ``--query "  foo "``
+                // so the FTS lane sees the same text in either case.
+                let raw = value(&mut argv, &flag)?;
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "--query value is empty or whitespace-only (got {raw:?}); \
+                         supply text or omit --query and use --tags-* instead"
+                    ));
+                }
+                query = Some(trimmed.to_string());
+            }
             "--tags-industry" => tags.industry = parse_csv(&value(&mut argv, &flag)?),
             "--tags-function" => tags.function = parse_csv(&value(&mut argv, &flag)?),
             "--tags-business-model" => tags.business_model = parse_csv(&value(&mut argv, &flag)?),
@@ -330,6 +364,70 @@ Exit codes:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_argv_rejects_whitespace_only_query() {
+        // A whitespace-only ``--query`` value is almost always a
+        // shell mistake (stray quote, an unset variable expanding
+        // to nothing) and the FTS lane downstream would skip the
+        // empty text and return zero hits with exit code 0 — a
+        // confusing silent-failure mode. The CLI now rejects it
+        // up-front with an actionable message.
+        for raw in ["", " ", "\t", "  \n  ", "\t \r\n"] {
+            let err = parse_argv(["--pack", "/tmp/x.pack", "--query", raw])
+                .expect_err(&format!("whitespace-only query {raw:?} should be rejected"));
+            assert!(
+                err.contains("empty or whitespace-only"),
+                "error should mention empty/whitespace; got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_argv_trims_query_whitespace_but_accepts_real_content() {
+        // Leading/trailing whitespace around real query text is a
+        // common shell artefact (e.g. ``--query "$user_input"``
+        // where user_input has surrounding spaces). The parser
+        // normalises by trimming so the FTS lane sees the same
+        // text regardless of how the caller quoted it.
+        let args = parse_argv(["--pack", "/tmp/x.pack", "--query", "  supply chain  "])
+            .expect("padded query should be accepted after trim");
+        assert_eq!(args.query.as_deref(), Some("supply chain"));
+    }
+
+    #[test]
+    fn parse_argv_requires_at_least_one_search_dimension() {
+        // The ``--query`` rejection above handles the whitespace
+        // case; this test pins the broader contract that the CLI
+        // requires either ``--query`` or at least one
+        // ``--tags-*`` family. Omitting both is a guaranteed
+        // empty result, so we reject it up-front rather than
+        // burn a tempdir + decompression + SQLite open on it.
+        let err = parse_argv(["--pack", "/tmp/x.pack"])
+            .expect_err("must reject when neither --query nor --tags-* supplied");
+        assert!(
+            err.contains("at least one of --query or --tags-*"),
+            "error should mention the two-of-N requirement; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_argv_accepts_tags_only_without_query() {
+        // Tag-only queries are a documented mode (the docstring at
+        // the top of this file calls them out), exercising the
+        // structured-match lane in isolation. The validation must
+        // not require ``--query`` when at least one ``--tags-*``
+        // family is supplied.
+        let args = parse_argv([
+            "--pack",
+            "/tmp/x.pack",
+            "--tags-industry",
+            "technology,fintech",
+        ])
+        .expect("tag-only query should be accepted");
+        assert!(args.query.is_none());
+        assert_eq!(args.tags.industry, vec!["technology", "fintech"]);
+    }
 
     #[test]
     fn parse_csv_strips_whitespace_and_drops_empties() {
