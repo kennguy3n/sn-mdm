@@ -141,15 +141,34 @@ fn write_registry() -> RwLockWriteGuard<'static, HashMap<PackHandle, Arc<OpenPac
     })
 }
 
-/// Allocate the next handle. Monotonic — never re-mints a value,
-/// so a use-after-close in JS is guaranteed to miss the registry
-/// rather than alias a different pack.
+/// Allocate the next handle. Monotonic — never re-mints a value
+/// during the lifetime of a process, so a use-after-close in JS
+/// is guaranteed to miss the registry rather than alias a
+/// different pack.
+///
+/// Panics if the counter ever wraps back to [`NONE_HANDLE`]. The
+/// counter starts at 1 and increments by 1 on every call, so the
+/// wrap point is exactly ``u64::MAX`` opens — at one billion opens
+/// per second that's ~584 billion years, well beyond any practical
+/// process lifetime. We panic rather than silently return the
+/// sentinel because handing back ``0`` would insert an entry into
+/// the registry that ``search`` and ``close_pack`` both refuse to
+/// look up (they reject ``NONE_HANDLE`` up-front), producing a
+/// silent leak. A panic at this point fails the process loudly
+/// instead, which is the airtight contract the doc comment claims.
 fn next_handle() -> PackHandle {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     // ``Relaxed`` is sufficient: ``fetch_add`` is an atomic RMW so
     // each caller receives a distinct value regardless of
     // ordering between threads.
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    let handle = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(
+        handle, NONE_HANDLE,
+        "pack_napi: PackHandle counter wrapped to NONE_HANDLE \
+         after u64::MAX opens — this should be unreachable in any \
+         practical process. Refusing to mint the sentinel value."
+    );
+    handle
 }
 
 /// Open and verify a ``.pack`` file at ``path``, returning a

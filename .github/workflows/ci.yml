@@ -62,7 +62,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-rust-${{ env.RUST_TOOLCHAIN }}-
             ${{ runner.os }}-cargo-rust-
-            ${{ runner.os }}-cargo-stable-
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
