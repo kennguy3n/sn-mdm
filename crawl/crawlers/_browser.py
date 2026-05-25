@@ -103,8 +103,12 @@ class _BrowserState:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         # `OrderedDict` for LRU-on-access semantics: cache.move_to_end
-        # promotes the most-recently-used entry.
-        self._cache: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
+        # promotes the most-recently-used entry. The key is a
+        # tuple of (url, wait_for_selector, wait_for_states) so a
+        # second call with stricter wait semantics doesn't get a
+        # stale partially-rendered snapshot — see comment in
+        # ``fetch_rendered`` for why URL-alone is unsafe.
+        self._cache: OrderedDict[tuple[object, ...], tuple[bytes, str]] = OrderedDict()
         atexit.register(self._shutdown)
 
     def context(self) -> BrowserContext:
@@ -157,17 +161,17 @@ class _BrowserState:
             )
             return self._context
 
-    def cache_get(self, url: str) -> tuple[bytes, str] | None:
+    def cache_get(self, key: tuple[object, ...]) -> tuple[bytes, str] | None:
         with self._lock:
-            hit = self._cache.get(url)
+            hit = self._cache.get(key)
             if hit is not None:
-                self._cache.move_to_end(url)
+                self._cache.move_to_end(key)
             return hit
 
-    def cache_put(self, url: str, value: tuple[bytes, str]) -> None:
+    def cache_put(self, key: tuple[object, ...], value: tuple[bytes, str]) -> None:
         with self._lock:
-            self._cache[url] = value
-            self._cache.move_to_end(url)
+            self._cache[key] = value
+            self._cache.move_to_end(key)
             while len(self._cache) > _PAGE_CACHE_MAX:
                 self._cache.popitem(last=False)
 
@@ -226,9 +230,14 @@ def fetch_rendered(
         ``("domcontentloaded", "networkidle")`` to let the network
         settle before snapshotting.
     timeout_ms:
-        Total navigation timeout in milliseconds. Defaults to 30 s
-        which matches the ``requests`` session timeout. Sites that
-        are reliably slow may raise this per-call.
+        Per-step navigation timeout in milliseconds — the budget
+        each ``wait_for_load_state`` / ``wait_for_selector`` step
+        is allowed to consume. Defaults to 30 s which matches the
+        ``requests`` session timeout. The total wall-clock time
+        across all steps can exceed ``timeout_ms`` by up to one
+        extra second per intermediate step because each step has
+        a 1 s floor to avoid zero-timeout failures when an
+        earlier step ate the whole budget.
     use_cache:
         Whether to consult the in-process LRU. Defaults to
         ``True``; set ``False`` to force a re-render (useful when
@@ -250,8 +259,18 @@ def fetch_rendered(
         responsible for catching and falling back to
         ``requests`` or skipping the slug.
     """
+    # The cache key is the full set of inputs that affect what the
+    # page snapshot looks like, not just the URL. A caller that
+    # asks for ``("domcontentloaded",)`` first and then
+    # ``("domcontentloaded", "networkidle")`` for the same URL
+    # needs the second response to actually have waited for
+    # ``networkidle`` — keying on URL alone would silently return
+    # the partially-rendered first response and yield bytes that
+    # the caller's BeautifulSoup parse can't make sense of.
+    states_key = tuple(wait_for_states)
+    cache_key: tuple[object, ...] = (url, wait_for_selector, states_key)
     if use_cache:
-        cached = _STATE.cache_get(url)
+        cached = _STATE.cache_get(cache_key)
         if cached is not None:
             return cached
 
@@ -261,7 +280,10 @@ def fetch_rendered(
         started = time.monotonic()
         # ``wait_until`` is the FIRST load-state we accept. We then
         # walk the rest of the requested states (e.g. networkidle)
-        # explicitly so the timeout budget covers the whole chain.
+        # explicitly. Each subsequent step gets the remaining
+        # ``timeout_ms`` budget floored at 1 s so zero-budget
+        # failures don't tip an otherwise-healthy fetch into
+        # ``TimeoutError`` (see ``timeout_ms`` docstring above).
         first_state, *rest_states = wait_for_states
         page.goto(url, wait_until=first_state, timeout=timeout_ms)
         for state in rest_states:
@@ -276,7 +298,7 @@ def fetch_rendered(
 
     value = (html.encode("utf-8"), "text/html; charset=utf-8")
     if use_cache:
-        _STATE.cache_put(url, value)
+        _STATE.cache_put(cache_key, value)
     return value
 
 
@@ -292,7 +314,9 @@ def warmup_origin(origin: str) -> None:
     it. Safe to call repeatedly — the singleton context dedupes
     cookie writes per-origin.
 
-    Used today by :class:`crawl.crawlers.wef_radio_davos.WefRadioDavosCrawler`.
+    Used today by :class:`crawl.crawlers.wef_radio_davos.WefRadioDavosCrawler`
+    via :meth:`BaseCrawler.warmup_origin` — see that method for
+    the per-crawler robots.txt + rate-limit wrapping.
     """
     parsed = urllib.parse.urlparse(origin)
     if not parsed.scheme or not parsed.netloc:

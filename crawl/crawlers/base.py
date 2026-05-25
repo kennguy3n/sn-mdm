@@ -681,6 +681,7 @@ class BaseCrawler:
         wait_for_selector: str | None = None,
         wait_for_states: tuple[str, ...] = ("domcontentloaded",),
         timeout_ms: int = 30_000,
+        max_attempts: int = 2,
     ) -> bytes:
         """Politely fetch ``url`` after rendering it in a real browser.
 
@@ -696,6 +697,14 @@ class BaseCrawler:
         Returns the raw HTML bytes; the caller does its own
         BeautifulSoup parsing exactly as it would with a
         ``requests`` :class:`~requests.Response`.
+
+        Transient ``playwright.sync_api.Error`` (navigation
+        timeout, intermediate TLS reset, transient page-close
+        race) is retried up to ``max_attempts`` times with a
+        linear backoff, matching the retry shape :meth:`fetch`
+        uses for 5xx / 408 / 429. ``PermissionError`` (robots.txt
+        disallow) is **not** retried — that's a contract failure,
+        not a transient condition.
         """
         # Defer the import so crawlers that never call this method
         # don't pay for the (optional) Playwright dependency at
@@ -717,14 +726,66 @@ class BaseCrawler:
         ua = self.session.headers.get("User-Agent", DEFAULT_USER_AGENT)
         if not rp.can_fetch(ua, url):
             raise PermissionError(f"robots.txt disallows {url} for {ua}")
+        # Playwright's exception base class lives in
+        # ``playwright.sync_api`` — import lazily to keep the
+        # Playwright dependency out of the import graph for
+        # ``requests``-only crawlers. Falling back to
+        # :class:`Exception` if the import fails (e.g. tests stub
+        # the transport without Playwright installed) keeps the
+        # retry contract intact for those callers too.
+        try:
+            from playwright.sync_api import Error as PlaywrightError
+        except ImportError:  # pragma: no cover - import guard only
+            PlaywrightError = Exception  # type: ignore[misc,assignment]
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            self._respect_rate_limit()
+            try:
+                html_bytes, _content_type = _browser.fetch_rendered(
+                    url,
+                    wait_for_selector=wait_for_selector,
+                    wait_for_states=wait_for_states,
+                    timeout_ms=timeout_ms,
+                )
+                return html_bytes
+            except PlaywrightError as exc:
+                last_exc = exc
+                if attempt >= max_attempts:
+                    break
+                # Linear backoff (1s, 2s, …). Short on purpose —
+                # the actual cost of a Chromium retry is bounded
+                # by ``timeout_ms``, not by the sleep.
+                time.sleep(attempt)
+        assert last_exc is not None
+        raise last_exc
+
+    def warmup_origin(self, origin: str) -> None:
+        """Politely prime the browser context for ``origin``.
+
+        Some WAFs (notably the WEF firewall) set a session cookie
+        on the first response to any URL on the origin and then
+        require that cookie on subsequent requests. Crawlers that
+        target those origins call this once before the first
+        ``fetch_rendered`` call so the singleton browser context
+        already carries the cookie when discovery hits the hub
+        page. Same robots.txt + rate-limit contract as
+        :meth:`fetch_rendered`; failures are warnings, not errors,
+        because the warmup is best-effort.
+        """
+        from crawl.crawlers import _browser
+
+        rp = self._robots_parser(origin)
+        ua = self.session.headers.get("User-Agent", DEFAULT_USER_AGENT)
+        # robots.txt is the safety check we never skip, even on a
+        # best-effort warmup. If the origin disallows us we
+        # surface that as ``PermissionError`` so the caller can
+        # decide not to proceed.
+        parsed = urllib.parse.urlparse(origin)
+        root = f"{parsed.scheme}://{parsed.netloc}/"
+        if not rp.can_fetch(ua, root):
+            raise PermissionError(f"robots.txt disallows {root} for {ua}")
         self._respect_rate_limit()
-        html_bytes, _content_type = _browser.fetch_rendered(
-            url,
-            wait_for_selector=wait_for_selector,
-            wait_for_states=wait_for_states,
-            timeout_ms=timeout_ms,
-        )
-        return html_bytes
+        _browser.warmup_origin(root)
 
     # -- contract surface --------------------------------------------------
 

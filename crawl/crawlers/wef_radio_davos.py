@@ -38,6 +38,7 @@ try to walk the whole 200+ episode archive in one shot.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 
@@ -65,6 +66,16 @@ class WefRadioDavosCrawler(BaseCrawler):
         return f"https://www.weforum.org/podcasts/radio-davos/episodes/{slug}/"
 
     def _discover_episode_slugs(self) -> list[str]:
+        # Prime the WAF cookie on weforum.org before discovery.
+        # The first request to a fresh browser context occasionally
+        # gets bounced by the WAF while the session cookie is
+        # being issued; hitting the origin root first reliably
+        # primes that cookie so the hub fetch succeeds on the
+        # first try. Failures are warnings — the subsequent
+        # ``fetch_rendered`` retry contract still catches a
+        # transient bounce.
+        with contextlib.suppress(Exception):
+            self.warmup_origin("https://www.weforum.org/")
         # Wait for ``networkidle`` so the hub page's lazy-loaded
         # episode list has hydrated before we snapshot the DOM.
         try:
@@ -207,51 +218,102 @@ def _meta_description(soup: BeautifulSoup) -> str:
     return ""
 
 
+# JSON-LD block types we consider canonical for episode metadata.
+# Other ``@type`` values that WEF also emits on the same page
+# (``BreadcrumbList``, ``Organization``, ``WebSite``) carry no
+# episode-level fields and are skipped.
+_JSONLD_EPISODE_TYPES = frozenset(
+    {"CreativeWork", "PodcastEpisode", "NewsArticle", "Article"}
+)
+# Strip the CDATA wrapper WEF emits around its JSON-LD payload.
+# The actual JSON content sits between the first ``{`` or ``[``
+# and the matching last ``}`` or ``]`` — we feed the whole
+# stripped string to ``json.loads`` rather than substring-matching
+# with a regex, because a greedy ``{...}`` regex would silently
+# corrupt ``[{...}, {...}]`` array payloads (see
+# :func:`_iter_jsonld_objects`).
+_CDATA_SHELL_RE = re.compile(r"^\s*//\s*<!\[CDATA\[|//\s*]]>\s*$", flags=re.M)
+
+
+def _iter_jsonld_objects(raw: str):
+    """Yield each dict in a JSON-LD payload.
+
+    Handles three shapes WEF and other publishers emit:
+
+    1. ``{"@type": "Article", ...}`` — a single object.
+    2. ``[{...}, {...}]`` — a top-level array of objects (the
+       shape RBC uses; WEF could plausibly migrate to this).
+    3. ``{"@context": ..., "@graph": [{...}, {...}]}`` — the
+       ``@graph`` envelope WordPress's JSON-LD plugin produces.
+
+    Strips the WEF CDATA shell first. We parse the entire payload
+    rather than substring-extracting with a regex because a
+    greedy ``{.*}`` regex would yield invalid JSON on the array
+    and ``@graph`` shapes, silently losing metadata.
+    """
+    payload = _CDATA_SHELL_RE.sub("", raw).strip()
+    if not payload:
+        return
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return
+    if isinstance(data, dict):
+        graph = data.get("@graph")
+        if isinstance(graph, list):
+            for item in graph:
+                if isinstance(item, dict):
+                    yield item
+            return
+        yield data
+        return
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                yield item
+
+
 def _extract_jsonld_metadata(soup: BeautifulSoup) -> dict[str, object]:
     """Pull the WEF ``schema.org/CreativeWork`` JSON-LD payload.
 
     WEF embeds episode metadata as ``<script type="application/ld+json">``
-    holding a ``CreativeWork`` (sometimes wrapped in CDATA). When
-    present we trust those fields over the looser title/date
-    regexes in :class:`BaseCrawler` — the JSON-LD is canonical.
+    holding a ``CreativeWork`` (sometimes wrapped in CDATA, and
+    occasionally inside an ``@graph`` envelope). When present we
+    trust those fields over the looser title/date regexes in
+    :class:`BaseCrawler` — the JSON-LD is canonical.
     """
     for s in soup.find_all("script", type="application/ld+json"):
         raw = s.string or s.text or ""
         if not raw:
             continue
-        # WEF wraps the payload in ``//<![CDATA[ ... //]]>`` —
-        # strip the CDATA shell before parsing.
-        match = re.search(r"(\{.*\})", raw, flags=re.S)
-        if not match:
-            continue
-        try:
-            data = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            continue
-        # We only want the ``CreativeWork`` / ``PodcastEpisode``
-        # blocks; the page also embeds ``BreadcrumbList`` and
-        # ``Organization`` payloads we don't care about.
-        t = data.get("@type") if isinstance(data, dict) else None
-        if t not in ("CreativeWork", "PodcastEpisode", "NewsArticle", "Article"):
-            continue
-        out: dict[str, object] = {}
-        if isinstance(data.get("headline"), str):
-            out["headline"] = data["headline"]
-        if isinstance(data.get("datePublished"), str):
-            out["datePublished"] = data["datePublished"]
-        if isinstance(data.get("description"), str):
-            out["description"] = data["description"]
-        authors = data.get("author")
-        if isinstance(authors, list):
-            names: list[str] = []
-            for a in authors:
-                if isinstance(a, dict) and isinstance(a.get("name"), str):
-                    names.append(a["name"])
-            if names:
-                out["authors"] = names
-        elif isinstance(authors, dict) and isinstance(authors.get("name"), str):
-            out["authors"] = [authors["name"]]
-        return out
+        for data in _iter_jsonld_objects(raw):
+            t = data.get("@type")
+            if isinstance(t, list):
+                # JSON-LD permits ``@type`` to be a list (e.g.
+                # ``["NewsArticle", "PodcastEpisode"]``); accept
+                # if any member matches.
+                if not any(tt in _JSONLD_EPISODE_TYPES for tt in t if isinstance(tt, str)):
+                    continue
+            elif t not in _JSONLD_EPISODE_TYPES:
+                continue
+            out: dict[str, object] = {}
+            if isinstance(data.get("headline"), str):
+                out["headline"] = data["headline"]
+            if isinstance(data.get("datePublished"), str):
+                out["datePublished"] = data["datePublished"]
+            if isinstance(data.get("description"), str):
+                out["description"] = data["description"]
+            authors = data.get("author")
+            if isinstance(authors, list):
+                names: list[str] = []
+                for a in authors:
+                    if isinstance(a, dict) and isinstance(a.get("name"), str):
+                        names.append(a["name"])
+                if names:
+                    out["authors"] = names
+            elif isinstance(authors, dict) and isinstance(authors.get("name"), str):
+                out["authors"] = [authors["name"]]
+            return out
     return {}
 
 

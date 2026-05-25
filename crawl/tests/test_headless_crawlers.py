@@ -316,6 +316,232 @@ def test_rbc_fetch_transcript_decodes_html_entities_in_title(
     assert raw.summary == "HTML meta description used as summary."
 
 
+# ---------------------------------------------------------------------------
+# Browser transport behaviours (cache key, JSON-LD shapes, retry)
+# ---------------------------------------------------------------------------
+
+
+_WEF_EPISODE_HTML_ARRAY = b"""<!doctype html>
+<html><head>
+<title>Array shape test</title>
+<script type="application/ld+json">
+[
+  {"@type": "BreadcrumbList", "name": "ignored"},
+  {
+    "@context": "http://schema.org",
+    "@type": "PodcastEpisode",
+    "headline": "Array-shape title",
+    "datePublished": "2026-05-01T00:00:00Z"
+  }
+]
+</script>
+</head><body>
+<div data-gtm-section="Podcast transcript">
+  <p>Robin Pomeroy: Hello array shape.</p>
+</div>
+</body></html>"""
+
+_WEF_EPISODE_HTML_GRAPH = b"""<!doctype html>
+<html><head>
+<title>@graph shape test</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {"@type": "WebPage"},
+    {
+      "@type": "Article",
+      "headline": "Graph-shape title",
+      "datePublished": "2026-05-02T00:00:00Z"
+    }
+  ]
+}
+</script>
+</head><body>
+<div data-gtm-section="Podcast transcript">
+  <p>Robin Pomeroy: Hello graph shape.</p>
+</div>
+</body></html>"""
+
+
+def test_wef_jsonld_handles_top_level_array(
+    monkeypatch: pytest.MonkeyPatch, wef_crawler: WefRadioDavosCrawler
+) -> None:
+    """Array-shaped JSON-LD payloads (``[{...}, {...}]``) must
+    parse like the single-object shape. Without
+    ``_iter_jsonld_objects`` this regressed silently into a
+    JSON-decode error: a greedy ``{.*}`` regex captures from the
+    first ``{`` to the last ``}``, spanning two adjacent
+    objects, and produces invalid JSON. This regression test
+    catches a future revert.
+    """
+    stub = _RenderStub({_WEF_EPISODE_URL: _WEF_EPISODE_HTML_ARRAY})
+    monkeypatch.setattr(wef_crawler, "fetch_rendered", stub)
+    raw = wef_crawler.fetch_transcript("sample-slug")
+    assert raw.title == "Array-shape title"
+    assert raw.publication_date == "2026-05-01"
+
+
+def test_wef_jsonld_handles_graph_envelope(
+    monkeypatch: pytest.MonkeyPatch, wef_crawler: WefRadioDavosCrawler
+) -> None:
+    """``@graph``-wrapped JSON-LD (WordPress's preferred shape)
+    must yield the same episode metadata as a top-level object.
+    """
+    stub = _RenderStub({_WEF_EPISODE_URL: _WEF_EPISODE_HTML_GRAPH})
+    monkeypatch.setattr(wef_crawler, "fetch_rendered", stub)
+    raw = wef_crawler.fetch_transcript("sample-slug")
+    assert raw.title == "Graph-shape title"
+    assert raw.publication_date == "2026-05-02"
+
+
+def test_browser_cache_key_separates_render_parameters() -> None:
+    """The browser-transport LRU is keyed by
+    ``(url, wait_for_selector, wait_for_states)`` not URL alone.
+    Without this, a second caller asking for stricter wait
+    semantics would silently get the first caller's partially
+    rendered snapshot \u2014 and a SPA that needs ``networkidle``
+    to settle would return an empty shell to BeautifulSoup.
+    Exercises ``_BrowserState`` directly so we don't have to
+    spin up Chromium to validate cache semantics.
+    """
+    from crawl.crawlers import _browser
+
+    state = _browser._BrowserState()
+    weak_key = ("https://example.com/x", None, ("domcontentloaded",))
+    strict_key = (
+        "https://example.com/x",
+        None,
+        ("domcontentloaded", "networkidle"),
+    )
+    state.cache_put(weak_key, (b"<weak/>", "text/html"))
+    # Same URL, stricter wait spec \u2014 must NOT alias to the weak
+    # response.
+    assert state.cache_get(strict_key) is None
+    # Identical parameters must hit (the WEF discovery + per
+    # episode fetch reuse the same hub key, so the cache has to
+    # serve a repeated lookup).
+    assert state.cache_get(weak_key) == (b"<weak/>", "text/html")
+    # A third key with a different selector also misses.
+    sel_key = ("https://example.com/x", "div.transcript", ("domcontentloaded",))
+    assert state.cache_get(sel_key) is None
+
+
+def test_browser_cache_lru_eviction_respects_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LRU eviction is what keeps the page cache bounded across
+    long Tranche-N runs. Lower the cap to 2 entries and confirm
+    the oldest is dropped first when a third entry is inserted.
+    """
+    from crawl.crawlers import _browser
+
+    monkeypatch.setattr(_browser, "_PAGE_CACHE_MAX", 2)
+    state = _browser._BrowserState()
+    state.cache_put(("a", None, ()), (b"A", "text/html"))
+    state.cache_put(("b", None, ()), (b"B", "text/html"))
+    state.cache_put(("c", None, ()), (b"C", "text/html"))
+    assert state.cache_get(("a", None, ())) is None  # evicted
+    assert state.cache_get(("b", None, ())) == (b"B", "text/html")
+    assert state.cache_get(("c", None, ())) == (b"C", "text/html")
+
+
+def test_fetch_rendered_retries_on_transient_playwright_error(
+    monkeypatch: pytest.MonkeyPatch, wef_crawler: WefRadioDavosCrawler
+) -> None:
+    """A transient Playwright error on the first attempt must be
+    retried, and a subsequent success must surface to the caller.
+    Mirrors :meth:`BaseCrawler.fetch`'s retry shape for 5xx /
+    408 / 429. Without retry, a single flaky navigation would
+    drop the whole episode \u2014 expensive on a 30+ s SPA fetch.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    from crawl.crawlers import _browser
+
+    attempts = {"n": 0}
+
+    def flaky_fetch(*_a: Any, **_kw: Any) -> tuple[bytes, str]:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise PlaywrightError("transient navigation timeout")
+        return (b"<html>ok</html>", "text/html")
+
+    monkeypatch.setattr(_browser, "fetch_rendered", flaky_fetch)
+    # Stub robots + rate-limit so the test stays network-free.
+    monkeypatch.setattr(wef_crawler, "_robots_parser", lambda _u: _AllowAll())
+    monkeypatch.setattr(wef_crawler, "_respect_rate_limit", lambda: None)
+    # Defang the linear backoff so the test stays fast.
+    import crawl.crawlers.base as _base
+
+    monkeypatch.setattr(_base.time, "sleep", lambda _s: None)
+    # Reach the real ``BaseCrawler.fetch_rendered``, not the stub
+    # the other tests install.
+    from crawl.crawlers.base import BaseCrawler
+
+    out = BaseCrawler.fetch_rendered(wef_crawler, "https://example.com/x")
+    assert out == b"<html>ok</html>"
+    assert attempts["n"] == 2
+
+
+def test_fetch_rendered_gives_up_after_max_attempts(
+    monkeypatch: pytest.MonkeyPatch, wef_crawler: WefRadioDavosCrawler
+) -> None:
+    """When every attempt fails, the final Playwright error must
+    surface to the caller. The pipeline relies on this to record
+    the failure in the per-episode error log; swallowing it would
+    silently drop episodes.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    from crawl.crawlers import _browser
+
+    attempts = {"n": 0}
+
+    def always_fails(*_a: Any, **_kw: Any) -> tuple[bytes, str]:
+        attempts["n"] += 1
+        raise PlaywrightError(f"attempt {attempts['n']} failed")
+
+    monkeypatch.setattr(_browser, "fetch_rendered", always_fails)
+    monkeypatch.setattr(wef_crawler, "_robots_parser", lambda _u: _AllowAll())
+    monkeypatch.setattr(wef_crawler, "_respect_rate_limit", lambda: None)
+    import crawl.crawlers.base as _base
+
+    monkeypatch.setattr(_base.time, "sleep", lambda _s: None)
+    from crawl.crawlers.base import BaseCrawler
+
+    with pytest.raises(PlaywrightError, match="attempt 3 failed"):
+        BaseCrawler.fetch_rendered(
+            wef_crawler, "https://example.com/x", max_attempts=3
+        )
+    assert attempts["n"] == 3
+
+
+def test_fetch_rendered_does_not_retry_permission_error(
+    monkeypatch: pytest.MonkeyPatch, wef_crawler: WefRadioDavosCrawler
+) -> None:
+    """A robots.txt disallow is a contract failure, not a
+    transient. Must raise immediately without consuming retry
+    budget \u2014 retrying would only delay the inevitable and
+    burn another full Chromium navigation.
+    """
+    from crawl.crawlers.base import BaseCrawler
+
+    class _DenyAll:
+        def can_fetch(self, _ua: str, _url: str) -> bool:
+            return False
+
+    monkeypatch.setattr(wef_crawler, "_robots_parser", lambda _u: _DenyAll())
+    monkeypatch.setattr(wef_crawler, "_respect_rate_limit", lambda: None)
+    with pytest.raises(PermissionError):
+        BaseCrawler.fetch_rendered(wef_crawler, "https://example.com/x")
+
+
+class _AllowAll:
+    def can_fetch(self, _ua: str, _url: str) -> bool:
+        return True
+
+
 def test_rbc_normalises_only_transcript_section(
     rbc_crawler: RbcDisruptorsCrawler,
 ) -> None:
