@@ -76,7 +76,16 @@ jobs:
         run: cargo test --all
 
   msrv:
-    name: rust MSRV (${{ env.RUST_MSRV }}, excludes pack_napi)
+    # Job ``name`` cannot reference ``env.*`` — the GitHub Actions
+    # expression context for ``jobs.<id>.name`` only exposes
+    # ``github / needs / strategy / matrix / vars / inputs``. If we
+    # put ``${{ env.RUST_MSRV }}`` here it resolves to an empty
+    # string and the UI shows ``rust MSRV (, excludes pack_napi)``.
+    # The pin itself lives in the workflow-level env block and is
+    # echoed at the top of the run so the actual version is always
+    # visible in the job log, even if a future bump forgets to
+    # touch the display label.
+    name: rust MSRV (excludes pack_napi)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -84,8 +93,10 @@ jobs:
 
       - name: Install Rust toolchain (MSRV)
         run: |
+          echo "Installing pinned MSRV: $RUST_MSRV"
           rustup toolchain install "$RUST_MSRV" --profile minimal
           rustup default "$RUST_MSRV"
+          rustc --version
 
       - name: Cache cargo
         uses: actions/cache@v4
