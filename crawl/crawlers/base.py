@@ -694,6 +694,12 @@ class BaseCrawler:
         seed list still dictates priority. This is the contract
         that lets us add new sources by populating the registry +
         an index-walker without touching the pipeline.
+
+        Discovery is best-effort: if :meth:`_discover_episode_slugs`
+        raises, the exception is logged and the seed list still
+        runs. Overrides are *not* required to catch their own
+        exceptions — the guard sits at the merge site so the
+        invariant holds for every subclass, current and future.
         """
         seen: set[str] = set()
         slugs: list[str] = []
@@ -705,7 +711,25 @@ class BaseCrawler:
         # entries in ``episodes`` would silently undercount the
         # discovery side.
         seed_slugs = list(dict.fromkeys(self.config.episodes))
-        for source in (seed_slugs, self._discover_episode_slugs()):
+        # Discovery is best-effort: a publisher's index page can 5xx,
+        # rate-limit us, or change shape on any given run. When that
+        # happens we still want the configured seeds to be crawled —
+        # silently dropping them because discovery raised would be a
+        # silent regression for any publisher that has both a curated
+        # seed set and a flaky index. We wrap the discovery call here
+        # (rather than relying on every override to catch internally)
+        # so the contract is enforced at the merge site for every
+        # subclass, current and future.
+        try:
+            discovered_slugs = list(self._discover_episode_slugs())
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(
+                "%s: _discover_episode_slugs raised (%s); falling back to seed list",
+                self.publisher_id,
+                exc,
+            )
+            discovered_slugs = []
+        for source in (seed_slugs, discovered_slugs):
             for slug in source:
                 if slug in seen:
                     continue

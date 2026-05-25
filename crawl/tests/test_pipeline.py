@@ -389,7 +389,12 @@ class DiscoveryMergeCrawler(BaseCrawler):
 def _merge_config(seeds: list[str]) -> CrawlerConfig:
     cfg = _config()
     return CrawlerConfig(
-        publisher_id=cfg.publisher_id,
+        # Align with DiscoveryMergeCrawler.publisher_id so the
+        # config would pass production __init__ validation (the
+        # test bypasses super().__init__, but matching IDs makes
+        # the fixture honest about the contract production
+        # crawlers operate under).
+        publisher_id="merge_fake",
         publisher_name=cfg.publisher_name,
         base_url=cfg.base_url,
         rights_code=cfg.rights_code,
@@ -456,6 +461,41 @@ def test_initial_sync_discovery_overlap_does_not_duplicate(tmp_path: Path) -> No
     )
     list(crawler.initial_sync())
     assert crawler.fetched == ["same-slug", "different-slug"]
+
+
+class _FailingDiscoveryCrawler(DiscoveryMergeCrawler):
+    """Subclass whose ``_discover_episode_slugs`` raises. Used to
+    verify that the seed list is still crawled when discovery
+    blows up — the regression case the round-8 review flagged.
+    """
+
+    def _discover_episode_slugs(self) -> list[str]:
+        raise RuntimeError("simulated index-walker failure")
+
+
+def test_initial_sync_discovery_failure_does_not_swallow_seeds(
+    tmp_path: Path, caplog
+) -> None:
+    """A future ``_discover_episode_slugs`` override that raises
+    must NOT prevent the configured seed list from being crawled.
+    The guard sits at the merge site so the contract holds for
+    every subclass without each subclass having to remember to
+    catch its own exceptions.
+    """
+    import logging
+
+    cfg = _merge_config(seeds=["seed-a", "seed-b"])
+    crawler = _FailingDiscoveryCrawler(cfg, tmp_path, discovered=[])
+    with caplog.at_level(logging.WARNING, logger="crawl.crawlers.base"):
+        list(crawler.initial_sync())
+    # Seeds were still fetched in order.
+    assert crawler.fetched == ["seed-a", "seed-b"]
+    # And the failure was logged as a warning naming the publisher.
+    assert any(
+        "_discover_episode_slugs raised" in rec.getMessage()
+        and "merge_fake" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 def test_initial_sync_log_counts_after_seed_dedup(
