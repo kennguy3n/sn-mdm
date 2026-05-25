@@ -113,18 +113,37 @@ class ImdCrawler(BaseCrawler):
         Pinning to ``data-elementor-type="wp-post"`` is the
         canonical fix: that attribute is Elementor's marker for
         the post-content wrapper and the only one IMD renders per
-        page. We additionally drop nested ``<article>`` blocks
-        (the in-body "you might also like" widget) so a future
-        Elementor layout change can't re-introduce the same
-        cross-episode chrome leak.
+        page.
+
+        Two related-cards strip strategies, chosen by whether we
+        successfully pinned to the wp-post container:
+
+        * **Pinned**: inside the wp-post container, blanket-strip
+          any nested ``<article>`` blocks. Those are the in-body
+          "you might also like" widget; the actual post body
+          rendered by Elementor is never an ``<article>``, so a
+          blanket strip is safe and forward-compatible.
+
+        * **Fallback** (wp-post marker missing): the related-
+          cards widget on IMD always uses ``class="card"``, so we
+          strip only ``<article class*="card">``. A future IMD
+          layout that puts the episode body inside a bare HTML5
+          ``<article>`` therefore still survives the fallback —
+          we'd rather ship a noisy episode than silently drop the
+          body.
         """
         soup = BeautifulSoup(raw_bytes, "lxml")
         for tag in soup(["script", "style", "noscript", "iframe", "nav", "footer", "header"]):
             tag.decompose()
         post = soup.find("div", attrs={"data-elementor-type": "wp-post"})
-        container = post or soup
-        for art in container.find_all("article"):
-            art.decompose()
+        if post is not None:
+            container = post
+            for art in container.find_all("article"):
+                art.decompose()
+        else:
+            container = soup
+            for art in container.select('article[class*="card"]'):
+                art.decompose()
         for level in range(1, 7):
             for h in container.find_all(f"h{level}"):
                 h.replace_with(f"\n{'#' * level} {h.get_text(strip=True)}\n")

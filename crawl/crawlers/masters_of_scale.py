@@ -107,6 +107,21 @@ class MastersOfScaleCrawler(BaseCrawler):
         such episode therefore lands in the same dedup bucket
         instead of polluting the catalogue with one "header-only"
         row per audio-only show — which is what we want.
+
+        Two further defences-in-depth:
+
+        * Captured candidates are tracked by ``id()`` and any
+          descendant of a previously-captured candidate is
+          skipped — otherwise a transcript paragraph wrapped in
+          a ``<blockquote>`` would emit twice (once for the
+          blockquote and once for the inner ``<p>``) and inflate
+          the dedup key.
+
+        * Structural sub-headings (``h3``-``h6``) inside the
+          transcript section are rendered as markdown headings so
+          the chunker can use them as section boundaries. Only
+          ``h1``/``h2`` are stop conditions; they bound the
+          transcript section, not its body.
         """
         soup = BeautifulSoup(raw_bytes, "lxml")
         for tag in soup(["script", "style", "noscript", "iframe", "nav", "footer", "header"]):
@@ -124,16 +139,34 @@ class MastersOfScaleCrawler(BaseCrawler):
                 break
         if target is None:
             return ""
-        paragraphs: list[str] = []
+        blocks: list[str] = []
+        captured_ids: set[int] = set()
+        sub_heading_re = re.compile(r"^h[3-6]$")
         for sib in target.find_all_next():
             name = getattr(sib, "name", None)
-            if name and re.match(r"^h[1-2]$", name):
+            if name is None:
+                continue
+            if re.match(r"^h[1-2]$", name):
                 break
+            # Skip descendants of an element we already emitted —
+            # otherwise ``<blockquote><p>X</p></blockquote>``
+            # yields X twice. ``parents`` iterates from immediate
+            # parent up to the document root.
+            if any(id(ancestor) in captured_ids for ancestor in sib.parents):
+                continue
             if name in ("p", "li", "blockquote"):
                 text = sib.get_text(" ", strip=True)
                 if text:
-                    paragraphs.append(text)
-        return _collapse_blank_lines("\n\n".join(paragraphs))
+                    blocks.append(text)
+                    captured_ids.add(id(sib))
+                continue
+            if sub_heading_re.match(name):
+                text = sib.get_text(" ", strip=True)
+                if text:
+                    level = int(name[1])
+                    blocks.append(f"{'#' * level} {text}")
+                    captured_ids.add(id(sib))
+        return _collapse_blank_lines("\n\n".join(blocks))
 
 
 def _meta_description(soup: BeautifulSoup) -> str:

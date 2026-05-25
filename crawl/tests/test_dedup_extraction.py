@@ -250,3 +250,97 @@ def test_mos_extraction_stops_at_next_top_level_heading(tmp_path: Path) -> None:
     text = crawler._normalize_html_bytes(html)
     assert "real transcript content" in text
     assert "related-episode promo" not in text
+
+
+def test_mos_does_not_duplicate_nested_blockquote_text(tmp_path: Path) -> None:
+    """``find_all_next()`` yields elements in document order
+    including descendants, so a transcript paragraph wrapped in
+    a ``<blockquote>`` would be matched twice — once for the
+    blockquote and once for the inner ``<p>`` — and the dedup
+    key would carry the doubled text. The extraction must
+    suppress descendants of an already-captured candidate so
+    each on-page paragraph contributes exactly once.
+    """
+    crawler = MastersOfScaleCrawler(
+        _config("masters_of_scale", "https://mastersofscale.com", "free_access_copyrighted"),
+        tmp_path,
+    )
+    html = b"""<!doctype html>
+<html><body>
+<div class="content">
+<h2>Transcript: with a quote</h2>
+<p>HOFFMAN: a leading paragraph.</p>
+<blockquote><p>ZUCKERBERG: a quoted paragraph that must not double.</p></blockquote>
+<ul><li>Bullet point one.</li><li>Bullet point two.</li></ul>
+<p>HOFFMAN: a trailing paragraph.</p>
+</div>
+</body></html>"""
+    text = crawler._normalize_html_bytes(html)
+    # Each on-page paragraph contributes exactly once.
+    assert text.count("a quoted paragraph that must not double") == 1
+    assert text.count("a leading paragraph") == 1
+    assert text.count("Bullet point one") == 1
+    assert text.count("Bullet point two") == 1
+    assert text.count("a trailing paragraph") == 1
+
+
+def test_mos_extracts_sub_headings_as_markdown(tmp_path: Path) -> None:
+    """If a future MoS layout introduces structural sub-headings
+    inside the transcript (e.g. ``Part 1``, ``Act II``), they
+    must surface in the normalised output so the chunker can use
+    them as section boundaries. The transcript-section stop
+    condition still uses h1/h2; intermediate h3-h6 are body
+    content. This mirrors the markdown-style rendering the
+    original Tranche-1 extractor used.
+    """
+    crawler = MastersOfScaleCrawler(
+        _config("masters_of_scale", "https://mastersofscale.com", "free_access_copyrighted"),
+        tmp_path,
+    )
+    html = b"""<!doctype html>
+<html><body>
+<div class="content">
+<h2>Transcript: structured episode</h2>
+<h3>Part 1</h3>
+<p>HOFFMAN: this is part one.</p>
+<h4>Aside</h4>
+<p>HOFFMAN: a brief aside.</p>
+<h3>Part 2</h3>
+<p>HOFFMAN: this is part two.</p>
+</div>
+</body></html>"""
+    text = crawler._normalize_html_bytes(html)
+    assert "Part 1" in text
+    assert "Part 2" in text
+    assert "Aside" in text
+    assert "this is part one" in text
+    assert "this is part two" in text
+
+
+# ---------------------------------------------------------------------------
+# IMD — wp-post fallback robustness
+# ---------------------------------------------------------------------------
+
+
+def test_imd_fallback_does_not_strip_article_when_no_elementor_marker(
+    tmp_path: Path,
+) -> None:
+    """If a future IMD layout drops the
+    ``data-elementor-type="wp-post"`` marker and instead uses a
+    bare HTML5 ``<article>`` as the post container, the
+    extractor must NOT decompose that article — otherwise the
+    fallback silently discards the episode body. Targeting the
+    related-cards strip on the specific
+    ``class*="card"`` selector keeps the related-widget removal
+    focused while the fallback remains robust.
+    """
+    crawler = ImdCrawler(_config("imd", "https://www.imd.org", "fair_use_review"), tmp_path)
+    text = crawler._normalize_html_bytes(
+        b"""<!doctype html><html><body>
+<article class="card">RELATED CARD: must be stripped.</article>
+<article><h1>Future layout post body</h1><p>Real episode body content.</p></article>
+</body></html>"""
+    )
+    assert "Real episode body content" in text
+    assert "Future layout post body" in text
+    assert "RELATED CARD" not in text
