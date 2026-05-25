@@ -110,6 +110,21 @@ PackBuilder::new(&store)
 The resulting `.pack` is a zstd-compressed SQLite database
 framed with a manifest the agent verifies before mount.
 
+The canonical Tranche 1 pack is committed in-tree at
+[`packs/sn-mdm-tranche1.pack`](packs/sn-mdm-tranche1.pack)
+(15 publishers, 220 episodes, 3,235 chunks). The in-tree
+copy is the current distribution channel — see the
+[`*.pack` block in `.gitignore`](.gitignore) for the
+rationale and the rebuild instructions below for how to
+regenerate it deterministically:
+
+```bash
+# from a fresh JSONL state under packs/{metadata,chunks,governance}/
+cargo run --release --bin pack-build -- \
+    --packs-root packs \
+    --output packs/sn-mdm-tranche1.pack
+```
+
 ## Querying a `.pack`
 
 Two surfaces ship with the workspace; both wrap the same

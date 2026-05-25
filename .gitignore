@@ -28,10 +28,26 @@ packs/raw/**/*
 packs/normalized/**/*
 !packs/**/.gitkeep
 
-# Built pack artifacts — ship via GitHub Release assets, not
-# in-tree.
+# Built pack artifacts.
+#
+# By default we keep .pack binaries out of git — they're large
+# and the canonical distribution channel is GitHub Release
+# assets attached at each tagged version (so downstream
+# consumers don't need git-lfs or a deep clone).
+#
+# Exception: ``packs/sn-mdm-tranche1.pack`` IS tracked at the
+# repo root packs/ directory. The Devin GitHub App can push
+# commits but lacks the ``contents: write`` scope needed to
+# publish release assets, so the in-tree copy is the only
+# distribution path available until the App permission is
+# granted. The committed .pack is rebuildable from the JSONL
+# trees under ``packs/{metadata,chunks,governance}/`` via the
+# ``pack-build`` CLI — see crates/pack_core/src/bin/pack_build.rs.
+# Treat it as a derived artefact that happens to live in-tree
+# rather than as source of truth.
 *.pack
 *.pack.idx
+!packs/sn-mdm-tranche1.pack
 
 # Editor / OS
 .DS_Store
