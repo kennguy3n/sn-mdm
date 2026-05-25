@@ -80,11 +80,18 @@ class PublisherStats:
     episodes_skipped_dedup: int = 0
     episodes_skipped_incremental: int = 0
     """Slugs short-circuited before the HTTP fetch because their
-    canonical ``episode_id`` was already in the governance log.
-    Only non-zero when the pipeline was constructed with
-    ``incremental=True``. Distinct from
+    canonical ``episode_id`` was already in the governance log
+    skip set the pipeline fed to
+    :meth:`BaseCrawler.incremental_sync`. Non-zero in *both*
+    modes: incremental-mode runs skip everything that was
+    previously admitted *or* persistently rejected; default-mode
+    runs skip only the persistently-rejected subset (so an
+    update to an already-admitted episode still round-trips
+    through the content-hash dedup gate). Distinct from
     :attr:`episodes_skipped_dedup` (which fires *after* the
-    transcript fetch, on a ``content_hash`` collision)."""
+    transcript fetch, on a ``content_hash`` collision). See
+    :meth:`Pipeline._pre_fetch_skip_set_for` for the full
+    composition rules."""
     chunks_emitted: int = 0
 
 
@@ -124,33 +131,61 @@ class Pipeline:
         self.configs = configs
         self.packs_root = Path(packs_root)
         self.rights_allowlist = {code.lower() for code in rights_allowlist}
-        # ``incremental`` toggles between two episode-iteration
-        # strategies on the crawler side. In the default mode the
-        # pipeline calls :meth:`BaseCrawler.initial_sync` which
-        # fetches every discovered + seeded slug; the content-hash
-        # gate then short-circuits already-known episodes *after*
-        # the HTTP fetch. In incremental mode the pipeline calls
-        # :meth:`BaseCrawler.incremental_sync` with the set of
-        # known ``episode_id``s for that publisher (computed from
-        # the governance log), so the crawler can skip the fetch
-        # entirely. The two modes are equivalent in output
-        # (steady-state runs produce the same JSONL either way),
-        # but incremental drops the HTTP cost of re-fetching
-        # already-ingested episodes.
+        # ``incremental`` widens the pre-fetch skip set the
+        # pipeline feeds to :meth:`BaseCrawler.incremental_sync`.
+        # Both modes route episodes through ``incremental_sync``
+        # (which falls back to a full ``initial_sync`` walk when
+        # the skip set is empty), but the skip set differs:
+        #
+        # * Default mode skips only persistently-rejected
+        #   episodes (deprecated rows whose ``rights_code`` is
+        #   still outside the current allowlist). The
+        #   previously-admitted episodes still get fetched so a
+        #   legitimate transcript update can be picked up by the
+        #   content-hash dedup gate.
+        # * Incremental mode skips both groups —
+        #   previously-admitted AND persistently-rejected. The
+        #   admitted side saves the HTTP fetch for every episode
+        #   already in the pack; an update would be missed until
+        #   the next default-mode run.
+        #
+        # The two modes are equivalent in *output* for a
+        # steady-state corpus (no updates to admitted episodes,
+        # no policy changes); incremental's added value is the
+        # HTTP-cost saving for the admitted majority.
         self.incremental = incremental
         # Map content_hash -> episode_id so re-crawls collapse on
         # already-seen content (third invariant from the research).
         self._seen_content_hashes: set[str] = set()
-        # Per-publisher set of ``episode_id``s admitted in some
-        # previous run. Populated alongside ``_seen_content_hashes``
-        # in a single pass over the governance log so the file is
-        # never opened twice for the same data. In default-mode
-        # runs the map is still computed (the cost is one extra
-        # ``str.startswith`` per record) so a future call into
-        # ``_known_ids_for`` doesn't have to re-read; this also
-        # keeps the boot-time invariant readable — one method, one
-        # pass.
+        # Per-publisher set of every ``episode_id`` the governance
+        # log knows about that should NOT be re-fetched on the next
+        # ``--incremental`` run — i.e. the union of (a) episodes
+        # admitted in some previous run (non-deprecated rows) and
+        # (b) episodes previously rejected by the rights gate whose
+        # ``rights_code`` is still outside the current
+        # ``rights_allowlist`` (deprecated rows that have not aged
+        # out of the policy). Populated alongside
+        # ``_seen_content_hashes`` in a single pass over the
+        # governance log.
         self._known_ids_by_publisher: dict[str, set[str]] = {
+            pid: set() for pid in self.configs
+        }
+        # The rejected-only subset of the map above. Maintained in
+        # lockstep — every write to ``_rejected_ids_by_publisher``
+        # is also mirrored into ``_known_ids_by_publisher`` so the
+        # union map remains the single "is this episode known to
+        # the governance log" query. The split exists because the
+        # *default* (non-incremental) pipeline mode also has a use
+        # for a pre-fetch skip set, but a narrower one: it must
+        # NOT skip previously-admitted episodes (those need to
+        # round-trip through the content-hash dedup gate so a
+        # legitimate transcript update can be picked up), but it
+        # SHOULD skip persistently-rejected episodes (re-fetching
+        # them only re-rejects and appends another deprecated row
+        # — unbounded log growth for zero output). See
+        # :meth:`_pre_fetch_skip_set_for` for the mode-aware
+        # composition rules.
+        self._rejected_ids_by_publisher: dict[str, set[str]] = {
             pid: set() for pid in self.configs
         }
         self._load_governance_state()
@@ -225,9 +260,15 @@ class Pipeline:
                     # in-process invariants must agree: a rejection
                     # under the active policy is sticky for the
                     # remainder of the run.
-                    self._known_ids_by_publisher.setdefault(
-                        publisher_id, set()
-                    ).add(crawler.episode_id_for_slug(raw.episode_slug))
+                    #
+                    # We write to *both* ``_known_ids_by_publisher``
+                    # (the union view used by incremental mode) and
+                    # ``_rejected_ids_by_publisher`` (the narrower
+                    # subset used by default mode's pre-fetch skip
+                    # — see :meth:`_pre_fetch_skip_set_for`).
+                    self._record_rejected_id(
+                        publisher_id, crawler.episode_id_for_slug(raw.episode_slug)
+                    )
                     continue
 
                 # Normalise *first* so the content-hash is available
@@ -261,6 +302,20 @@ class Pipeline:
                     # the skip to ``episodes_skipped_incremental``
                     # instead of ``episodes_skipped_dedup`` in the
                     # repeat stats.
+                    #
+                    # A dedup hit means the existing governance
+                    # entry is non-deprecated (we never carry
+                    # deprecated-row hashes into
+                    # ``_seen_content_hashes`` — see
+                    # ``_load_governance_state``), so the slug
+                    # belongs in the admitted side of the split.
+                    # That means default mode does NOT skip it on
+                    # the next run (the content-hash gate is still
+                    # the right check), only incremental mode
+                    # does — exactly the current behaviour. We
+                    # write only to ``_known_ids_by_publisher``
+                    # (the incremental-mode union), not the
+                    # narrower rejected map.
                     self._known_ids_by_publisher.setdefault(
                         publisher_id, set()
                     ).add(crawler.episode_id_for_slug(raw.episode_slug))
@@ -292,6 +347,13 @@ class Pipeline:
                 # gate would still suppress the duplicate emission
                 # (output stays correct) but the operator-facing
                 # stats would be misleading.
+                #
+                # Admit goes to the union map only (NOT the
+                # rejected-subset map) so default mode continues
+                # to re-fetch on subsequent runs and route through
+                # the content-hash dedup gate — that's the only
+                # path that picks up a legitimate transcript
+                # update for an already-admitted episode.
                 self._known_ids_by_publisher.setdefault(
                     publisher_id, set()
                 ).add(crawler.episode_id_for_slug(raw.episode_slug))
@@ -309,18 +371,87 @@ class Pipeline:
     def _iter_episodes(self, crawler: BaseCrawler) -> list[RawEpisode]:
         # Materialise to a list so the iteration order is
         # deterministic across runs (the crawler's own generators
-        # are deterministic but `list(...)` makes the contract
+        # are deterministic but ``list(...)`` makes the contract
         # obvious in tracebacks).
-        if self.incremental:
-            known = self._known_ids_for(crawler.publisher_id)
-            episodes = list(crawler.incremental_sync(known_episode_ids=known))
-        else:
-            episodes = list(crawler.initial_sync())
+        #
+        # Both modes go through ``incremental_sync`` — only the
+        # skip-set composition differs. The contract of
+        # ``incremental_sync`` is to enumerate slugs (via
+        # :meth:`BaseCrawler._enumerate_slugs` for the production
+        # crawlers; via the override's body for test fixtures)
+        # and skip those whose canonical ``episode_id`` is in
+        # ``known_episode_ids`` *before* the per-episode HTTP
+        # fetch. With an empty skip set the method falls back to
+        # the full :meth:`initial_sync` walk, so default-mode
+        # behaviour is preserved when the governance log is empty
+        # or has no deprecated-still-rejected entries.
+        skip_set = self._pre_fetch_skip_set_for(crawler.publisher_id)
+        episodes = list(crawler.incremental_sync(known_episode_ids=skip_set))
         return episodes
 
+    def _record_rejected_id(self, publisher_id: str, episode_id: str) -> None:
+        """Write ``episode_id`` to *both* skip-set maps.
+
+        Centralised so the lockstep invariant between
+        ``_known_ids_by_publisher`` (the incremental-mode union)
+        and ``_rejected_ids_by_publisher`` (the default-mode
+        subset) is enforced at every write site (boot-time replay
+        in :meth:`_load_governance_state` plus the in-process
+        rejected path in :meth:`run_publisher`). A bug where one
+        map is updated and the other is not would silently shift
+        default-mode pre-fetch skips between runs in opaque ways.
+        """
+        self._known_ids_by_publisher.setdefault(publisher_id, set()).add(episode_id)
+        self._rejected_ids_by_publisher.setdefault(publisher_id, set()).add(episode_id)
+
+    def _pre_fetch_skip_set_for(self, publisher_id: str) -> frozenset[str]:
+        """Return the set of ``episode_id``s the crawler should
+        skip *before* paying for the per-episode HTTP fetch.
+
+        Composition depends on ``self.incremental``:
+
+        * **Incremental mode** (``--incremental`` on the CLI):
+          everything that's "known to the governance log" — the
+          union of (a) episodes previously admitted (the pack
+          already has them) and (b) episodes previously rejected
+          AND whose ``rights_code`` is still outside the current
+          allowlist. Equivalent to :meth:`_known_ids_for`. Saves
+          one HTTP request per known episode in steady state.
+
+        * **Default mode** (no ``--incremental``): only the
+          rejected subset. Previously-admitted episodes are NOT
+          pre-skipped — they're re-fetched and routed through the
+          content-hash dedup gate so a legitimate transcript
+          update on an existing episode can be picked up. The
+          rejected subset *is* pre-skipped because re-fetching
+          persistently-rejected episodes only re-rejects them and
+          appends another deprecated row, producing unbounded
+          governance-log growth and zero new output.
+
+        Both modes fall through to a full :meth:`initial_sync`
+        walk when the resulting set is empty (see
+        :meth:`BaseCrawler.incremental_sync`), so a fresh
+        ``packs/`` tree or a publisher with no deprecated-still-
+        rejected entries behaves identically to a pre-split
+        pipeline.
+        """
+        rejected = self._rejected_ids_by_publisher.get(publisher_id, ())
+        if not self.incremental:
+            return frozenset(rejected)
+        admitted_union = self._known_ids_by_publisher.get(publisher_id, ())
+        return frozenset(admitted_union)
+
     def _known_ids_for(self, publisher_id: str) -> frozenset[str]:
-        """Return the set of ``episode_id``s the incremental gate
-        should skip for ``publisher_id``.
+        """Return the set of ``episode_id``s known to the
+        governance log for ``publisher_id``.
+
+        This is the *union* view — admitted episodes plus
+        persistently-rejected episodes (deprecated rows whose
+        ``rights_code`` is still outside the current allowlist).
+        It's the historically-named accessor; the mode-aware
+        skip-set the pipeline actually feeds to the crawler is
+        :meth:`_pre_fetch_skip_set_for`, which narrows to just
+        the rejected subset in default mode.
 
         The underlying ``_known_ids_by_publisher`` map is populated
         once at construction time (single pass over the governance
@@ -331,8 +462,8 @@ class Pipeline:
         content-hash-deduped). This means a second
         ``run_publisher`` call for the same publisher inside one
         :class:`Pipeline` lifetime (e.g. duplicate entry in the
-        ``targets`` list) short-circuits at the incremental gate
-        — saving the wasted HTTP fetch — regardless of which gate
+        ``targets`` list) short-circuits at the pre-fetch gate —
+        saving the wasted HTTP fetch — regardless of which gate
         the first call ended at.
 
         Skip-set composition rules (cross-reference
@@ -552,17 +683,32 @@ class Pipeline:
                 # prefix would otherwise overlap an existing
                 # ``foo``/``bar`` pair), which prefix matching
                 # alone cannot disambiguate.
+                #
+                # Deprecated-still-rejected rows go to *both* the
+                # union map and the rejected-subset map (via
+                # :meth:`_record_rejected_id`); non-deprecated
+                # rows go only to the union map so default mode
+                # doesn't pre-skip them and the content-hash
+                # dedup gate stays the active check for updates
+                # to already-admitted episodes.
+                target_pid: str | None = None
                 explicit_pid = rec.get("publisher_id")
                 if (
                     isinstance(explicit_pid, str)
                     and explicit_pid in self._known_ids_by_publisher
                 ):
-                    self._known_ids_by_publisher[explicit_pid].add(ep_id)
+                    target_pid = explicit_pid
+                else:
+                    for pid, prefix in prefixes:
+                        if ep_id.startswith(prefix):
+                            target_pid = pid
+                            break
+                if target_pid is None:
                     continue
-                for pid, prefix in prefixes:
-                    if ep_id.startswith(prefix):
-                        self._known_ids_by_publisher[pid].add(ep_id)
-                        break
+                if is_deprecated:
+                    self._record_rejected_id(target_pid, ep_id)
+                else:
+                    self._known_ids_by_publisher[target_pid].add(ep_id)
 
 
 # ------------------------------------------------------------------
@@ -656,18 +802,21 @@ def main(argv: list[str] | None = None) -> int:
         "--incremental",
         action="store_true",
         help=(
-            "Steady-state mode. Skip slugs whose canonical episode_id is "
-            "already known from the governance log, BEFORE the transcript "
-            "fetch. 'Known' means either (a) previously admitted (the pack "
-            "already has it) or (b) previously rejected by the rights gate "
-            "AND the recorded rights_code is still outside the current "
-            "rights_allowlist (re-fetching would only re-reject and append "
-            "another deprecated row). Episodes whose rights_code is now in "
-            "the allowlist (operator extended the allowlist between runs) "
+            "Steady-state mode. Pre-fetch skip set is widened to include "
+            "previously-admitted episodes in addition to the persistently-"
+            "rejected ones that default mode also skips. Skip composition: "
+            "(a) every episode previously admitted (the pack already has "
+            "it) and (b) every episode previously rejected AND whose "
+            "rights_code is still outside the current rights_allowlist "
+            "(re-fetching would only re-reject and append another "
+            "deprecated row). Episodes whose rights_code is now in the "
+            "allowlist (operator extended the allowlist between runs) "
             "are NOT skipped, so the new policy can take effect. Default "
-            "mode runs the full discovery + transcript fetch loop and "
-            "relies on the content_hash gate to skip duplicates AFTER the "
-            "HTTP fetch."
+            "mode runs the full discovery + transcript fetch loop for "
+            "previously-admitted episodes (so a legitimate transcript "
+            "update can be picked up via the content_hash gate) but it "
+            "*also* pre-fetch-skips persistently-rejected episodes for "
+            "the same governance-log-growth reason as incremental mode."
         ),
     )
     args = parser.parse_args(argv)

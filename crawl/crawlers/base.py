@@ -932,7 +932,7 @@ class BaseCrawler:
         self,
         known_episode_ids: frozenset[str] | None = None,
     ) -> Iterator[RawEpisode]:
-        """Steady-state pull — fetch only slugs whose canonical
+        """Pre-fetch skip pull — fetch only slugs whose canonical
         ``episode_id`` is not already present in
         ``known_episode_ids``.
 
@@ -941,15 +941,24 @@ class BaseCrawler:
         The crawler treats the set as opaque — the policy that
         produced it lives in :class:`crawl.pipeline.Pipeline`
         (see :meth:`crawl.pipeline.Pipeline._load_governance_state`
-        and :meth:`crawl.pipeline.Pipeline._known_ids_for` for the
-        composition rules). Concretely, the set contains every
-        episode currently in the pack (so re-fetching would just
-        round-trip the same content) AND every previously-rejected
-        episode whose ``rights_code`` is still outside the active
-        rights allowlist (so re-fetching would just re-reject and
-        append another deprecated governance row). It does *not*
-        contain previously-rejected episodes whose ``rights_code``
-        is now in the allowlist — those need to be re-fetched so
+        and :meth:`crawl.pipeline.Pipeline._pre_fetch_skip_set_for`
+        for the composition rules). Both pipeline modes call
+        this method; only the skip-set composition differs.
+
+        * **Incremental mode** (``Pipeline(incremental=True)``):
+          the set contains every episode currently in the pack
+          *and* every previously-rejected episode whose
+          ``rights_code`` is still outside the active rights
+          allowlist.
+        * **Default mode** (``incremental=False``, the
+          historical behaviour): the set contains only the
+          persistently-rejected subset — admitted episodes are
+          still re-fetched so the content-hash dedup gate can
+          detect legitimate transcript updates.
+
+        In either mode the set does *not* contain
+        previously-rejected episodes whose ``rights_code`` is
+        now in the allowlist — those need to be re-fetched so
         the rights gate can re-admit under the new policy.
 
         Passing ``None`` or an empty set falls back to a full

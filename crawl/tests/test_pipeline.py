@@ -58,6 +58,47 @@ class FakeCrawler(BaseCrawler):
             summary="A test episode.",
         )
 
+    def incremental_sync(self, known_episode_ids=None):
+        """Override to wrap :meth:`initial_sync` with the
+        pre-fetch skip filter so the test fixture conforms to
+        the base contract documented at
+        :meth:`BaseCrawler.incremental_sync` ("if you override
+        ``initial_sync`` you MUST also override
+        ``incremental_sync``").
+
+        The base implementation in ``BaseCrawler`` uses
+        :meth:`_enumerate_slugs` which composes
+        ``config.episodes`` and :meth:`_discover_episode_slugs`.
+        Test fixtures here override ``initial_sync`` directly
+        and have empty ``config.episodes`` plus the default
+        empty ``_discover_episode_slugs``, so the inherited base
+        ``incremental_sync`` with a non-empty ``known`` set
+        would silently yield zero episodes. This override
+        bridges the gap by iterating the override
+        ``initial_sync`` output and dropping any
+        ``RawEpisode`` whose canonical ``episode_id`` is in the
+        skip set, which is exactly what the production
+        :meth:`_enumerate_slugs` + per-slug filter path does
+        for the real crawlers.
+
+        Subclasses of :class:`FakeCrawler` inherit this override,
+        so :class:`PerEpisodeRightsCrawler` and the inline
+        ``TwinSlugDedupCrawler`` in the regression-test below
+        don't need their own copy.
+        """
+        known = frozenset(known_episode_ids or ())
+        self.last_incremental_skip_count = 0
+        if not known:
+            yield from self.initial_sync()
+            return
+        skipped = 0
+        for raw in self.initial_sync():
+            if self.episode_id_for_slug(raw.episode_slug) in known:
+                skipped += 1
+                continue
+            yield raw
+        self.last_incremental_skip_count = skipped
+
     def normalize(self, raw):
         from crawl.crawlers.base import canonicalise_text, content_hash
 
@@ -139,6 +180,152 @@ def test_rights_gate_rejects_unknown_codes(tmp_path: Path) -> None:
     parsed = [json.loads(line) for line in governance]
     assert all(p["deprecated"] for p in parsed)
     assert parsed[0]["rights_code"] == "paywalled"
+
+
+def test_default_mode_skips_persistently_rejected_pre_fetch(tmp_path: Path) -> None:
+    """Default-mode re-runs must pre-fetch-skip persistently-rejected
+    episodes the same way ``--incremental`` does.
+
+    Without this, a publisher with a paywalled rights_code (or
+    any code outside the current allowlist) would re-fetch the
+    same episode, re-run the gate, and append another deprecated
+    governance row on every run \u2014 producing unbounded log
+    growth for zero new output. The fix splits the boot-time
+    skip-set load so the rejected subset is fed to the crawler
+    in both modes; only the admitted subset is gated behind
+    ``--incremental``.
+
+    Round-10 regression for the default-mode log-growth finding
+    flagged on PR #7 (and resolved in a follow-up PR).
+    """
+    _register_fake()
+
+    # First run: rejects the single fake episode under the
+    # paywalled rights_code and writes one deprecated governance
+    # entry.
+    first_pipeline = Pipeline(
+        configs={"fake": _config("paywalled")},
+        packs_root=tmp_path,
+    )
+    first = first_pipeline.run(["fake"])
+    first_stats = first.by_publisher["fake"]
+    assert first_stats.episodes_seen == 1
+    assert first_stats.episodes_rejected_rights == 1
+    assert first_stats.episodes_skipped_incremental == 0
+    governance_after_first = (
+        (tmp_path / "governance" / "rights_log.jsonl")
+        .read_text()
+        .strip()
+        .splitlines()
+    )
+    assert len(governance_after_first) == 1
+    assert json.loads(governance_after_first[0])["deprecated"] is True
+
+    # Second run: same default mode, same policy. The episode is
+    # in the persistently-rejected set and must be skipped before
+    # the (synthetic) HTTP fetch \u2014 i.e. ``episodes_seen == 0``,
+    # the skip is attributed to the incremental counter, and no
+    # new deprecated row is appended.
+    second_pipeline = Pipeline(
+        configs={"fake": _config("paywalled")},
+        packs_root=tmp_path,
+    )
+    second = second_pipeline.run(["fake"])
+    second_stats = second.by_publisher["fake"]
+    assert second_stats.episodes_seen == 0, (
+        "default-mode re-run must pre-fetch-skip the rejected episode"
+    )
+    assert second_stats.episodes_rejected_rights == 0
+    assert second_stats.episodes_skipped_incremental == 1
+    governance_after_second = (
+        (tmp_path / "governance" / "rights_log.jsonl")
+        .read_text()
+        .strip()
+        .splitlines()
+    )
+    assert len(governance_after_second) == 1, (
+        "default-mode re-run must NOT append a duplicate deprecated row"
+    )
+
+
+def test_default_mode_does_not_skip_admitted_pre_fetch(tmp_path: Path) -> None:
+    """Default-mode re-runs must still re-fetch previously-admitted
+    episodes so the content-hash dedup gate can pick up a
+    legitimate transcript update. Only the *rejected* subset is
+    in the default-mode pre-fetch skip set \u2014 admitted episodes
+    are routed through ``initial_sync`` \u2192 ``normalize`` \u2192 dedup
+    as they were before the split.
+
+    Companion test to
+    :func:`test_default_mode_skips_persistently_rejected_pre_fetch`
+    that pins the *other* half of the split: admitted episodes
+    are NOT pre-skipped in default mode.
+    """
+    _register_fake()
+    first_pipeline = Pipeline(
+        configs={"fake": _config("free_access_copyrighted")},
+        packs_root=tmp_path,
+    )
+    first = first_pipeline.run(["fake"])
+    assert first.by_publisher["fake"].episodes_admitted == 1
+
+    second_pipeline = Pipeline(
+        configs={"fake": _config("free_access_copyrighted")},
+        packs_root=tmp_path,
+    )
+    second = second_pipeline.run(["fake"])
+    second_stats = second.by_publisher["fake"]
+    # The episode WAS fetched (``episodes_seen == 1``) and got
+    # absorbed by the content-hash dedup gate \u2014 NOT pre-fetch-
+    # skipped. This is the contract that lets a legitimate
+    # transcript update be detected on a re-run.
+    assert second_stats.episodes_seen == 1
+    assert second_stats.episodes_skipped_dedup == 1
+    assert second_stats.episodes_skipped_incremental == 0
+
+
+def test_default_mode_skip_yields_to_allowlist_change(tmp_path: Path) -> None:
+    """If the operator extends the allowlist between runs to cover
+    a previously-rejected ``rights_code``, the second default-mode
+    run must NOT skip the episode \u2014 the rights gate has to get
+    another shot at admitting it under the new policy.
+
+    Exercises the policy-aware ``still_rejected`` guard in
+    :meth:`Pipeline._load_governance_state` from the default-mode
+    angle (the incremental-mode angle is covered by
+    :func:`test_pipeline_deprecated_entry_rechecks_when_rights_now_allowed`).
+    """
+    _register_fake()
+    first_pipeline = Pipeline(
+        configs={"fake": _config("paywalled")},
+        packs_root=tmp_path,
+        rights_allowlist=("free_access_copyrighted",),
+    )
+    first_pipeline.run(["fake"])
+    assert first_pipeline._rejected_ids_by_publisher["fake"] == {
+        "fake_flagship_hello-world"
+    }
+
+    # Operator extends the allowlist between runs. The
+    # deprecated entry's ``rights_code`` (``"paywalled"``) is now
+    # in the active set, so ``_load_governance_state`` must not
+    # add the episode_id to the rejected map, and the default-mode
+    # pre-fetch skip set therefore does not contain it.
+    relaxed = ("free_access_copyrighted", "paywalled")
+    second_pipeline = Pipeline(
+        configs={"fake": _config("paywalled")},
+        packs_root=tmp_path,
+        rights_allowlist=relaxed,
+    )
+    assert second_pipeline._rejected_ids_by_publisher["fake"] == set()
+    second = second_pipeline.run(["fake"])
+    second_stats = second.by_publisher["fake"]
+    # The episode was re-fetched and the rights gate admitted it
+    # under the relaxed allowlist \u2014 producing a fresh
+    # non-deprecated governance row.
+    assert second_stats.episodes_seen == 1
+    assert second_stats.episodes_admitted == 1
+    assert second_stats.episodes_skipped_incremental == 0
 
 
 def test_dedup_skips_seen_content_hashes(tmp_path: Path) -> None:
@@ -1202,6 +1389,91 @@ def test_incremental_sync_log_line_uses_incremental_prefix(
         "incremental_sync — 1 known skipped, 0 attempted, 0 failed" in m
         for m in msgs
     )
+
+
+def test_fake_crawler_incremental_sync_filters_known(tmp_path: Path) -> None:
+    """Pins the round-10 contract closure: :class:`FakeCrawler`
+    (and its subclasses) override :meth:`BaseCrawler.incremental_sync`
+    to filter the override-:meth:`initial_sync` output by
+    ``known_episode_ids``.
+
+    Without the override, the inherited base
+    :meth:`BaseCrawler.incremental_sync` would route through
+    :meth:`_enumerate_slugs` \u2014 which composes ``config.episodes``
+    and :meth:`_discover_episode_slugs`, both empty/default on
+    these fixtures \u2014 and therefore silently yield zero episodes
+    for any non-empty ``known`` set. The bug was previously
+    latent because no test exercised the FakeCrawler-incremental-
+    with-non-empty-known path; pin it here so a future regression
+    surfaces immediately.
+    """
+    crawler = FakeCrawler(_config(), tmp_path)
+    # Empty known: behaves identically to ``initial_sync`` \u2014 one
+    # episode yielded, skip counter stays at 0.
+    yielded = list(crawler.incremental_sync(known_episode_ids=frozenset()))
+    assert [r.episode_slug for r in yielded] == ["hello-world"]
+    assert crawler.last_incremental_skip_count == 0
+
+    # Non-empty known with the lone slug present: zero yields,
+    # skip counter at 1.
+    known = frozenset({crawler.episode_id_for_slug("hello-world")})
+    yielded = list(crawler.incremental_sync(known_episode_ids=known))
+    assert yielded == []
+    assert crawler.last_incremental_skip_count == 1
+
+    # Non-empty known with an unrelated slug: still yields the
+    # one episode, skip counter back to 0.
+    yielded = list(
+        crawler.incremental_sync(
+            known_episode_ids=frozenset({"some_other_pid_other_other-slug"})
+        )
+    )
+    assert [r.episode_slug for r in yielded] == ["hello-world"]
+    assert crawler.last_incremental_skip_count == 0
+
+
+def test_pipeline_default_mode_second_call_pre_fetch_skips(tmp_path: Path) -> None:
+    """Two ``run_publisher`` invocations against the same publisher
+    inside one default-mode :class:`Pipeline` lifetime: the
+    second must pre-fetch-skip the rejected episode_id added to
+    ``_rejected_ids_by_publisher`` during the first call.
+
+    Mirrors :func:`test_pipeline_in_memory_skip_set_updates_after_rights_rejection`
+    but from the default-mode side. Pins the in-process invariant
+    that the in-loop write at the rejected path goes to BOTH the
+    union map (incremental-only) AND the rejected subset
+    (default-mode-active).
+    """
+    _register_fake()
+    pipeline = Pipeline(
+        configs={"fake": _config("paywalled")},
+        packs_root=tmp_path,
+        # Default mode \u2014 ``incremental=False``.
+    )
+    first = pipeline.run_publisher("fake")
+    assert first.episodes_seen == 1
+    assert first.episodes_rejected_rights == 1
+    assert pipeline._rejected_ids_by_publisher["fake"] == {
+        "fake_flagship_hello-world"
+    }
+
+    # Second call within the same Pipeline lifetime: the rejected
+    # set was updated in-process, the default-mode pre-fetch skip
+    # picks up the change, and the episode is filtered before
+    # being yielded to the pipeline.
+    second = pipeline.run_publisher("fake")
+    assert second.episodes_seen == 0
+    assert second.episodes_rejected_rights == 0
+    assert second.episodes_skipped_incremental == 1
+    # The governance log still has exactly one deprecated row from
+    # the first call \u2014 the second call did NOT append.
+    governance = (
+        (tmp_path / "governance" / "rights_log.jsonl")
+        .read_text()
+        .strip()
+        .splitlines()
+    )
+    assert len(governance) == 1
 
 
 def test_initial_sync_log_line_keeps_initial_prefix(
