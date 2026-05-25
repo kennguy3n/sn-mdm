@@ -83,21 +83,35 @@ each source.
 | `microsoft_cyber`  | `post-sitemap{1,2}.xml`    | working — 25 episode permalinks (`Public Sector Future` + `Future of Infrastructure`). One per-run skip when `traffic.libsyn.com` `robots.txt` disallows a transcript PDF — expected behaviour.           |
 | `ncsc`             | (single-page, seeded)      | working — 1 verbatim CISO-board transcript page, OGL-v3.                                           |
 | `people_matters`   | `sitemap.xml/podcast`      | working — 25 of 61 podcast permalinks (series *hub* pages — slugs without an embedded `/<ep-slug>` — are rejected; only true `<series>/<episode>` permalinks are admitted).                                                             |
-| `deutsche_bank`    | n/a                        | **Gap** — `corporates.db.com` is a Drupal CMS that renders the episode list client-side and ships no per-show sitemap. Needs a headless-browser walker (out of scope for this PR). |
-| `mckinsey`         | n/a                        | **Gap** — `www.mckinsey.com` times out on every plain HTTPS GET from this VM (likely a WAF rule). Needs either a different egress IP or a headless-browser walker. |
-| `rbc_disruptors`   | n/a                        | **Gap** — `thoughtleadership.rbc.com/rbc-disruptors-archives/` redirects to `www.rbc.com/en/thought-leadership/disruptors/` which is fully client-rendered. No sitemap subset for podcasts. |
-| `rics`             | n/a                        | **Gap** — `rics.org` sitemap lists category landings only, not individual episodes. The podcast cards on the category pages are React-rendered. |
-| `ted_worklife`     | n/a                        | **Gap** — TED migrated to a Next.js SPA; the `worklife` season pages are client-rendered and the global sitemap only lists playlists, not per-episode transcript pages. The historical `*-transcript` URL pattern returns 404. |
-| `thomson_reuters`  | n/a                        | **Gap** — the global sitemap is a flat urlset with no podcast prefix; the legal-blog category page is React-rendered. |
-| `wef_radio_davos`  | n/a                        | **Gap** — `weforum.org` returns HTTP 403 on every endpoint accessed without a residential browser fingerprint. The sitemap is gated by the same WAF rule. |
+| `rbc_disruptors`   | `/en/thought-leadership/disruptors/` (headless) | working — 11 episode permalinks per run via Playwright. Discovery + per-episode fetch route through `BaseCrawler.fetch_rendered` because the archive page is a fully client-rendered React tree. |
+| `wef_radio_davos`  | `/podcasts/radio-davos/` (headless)             | working — 7 episode permalinks per run via Playwright. `weforum.org` returns HTTP 403 to plain `requests` GETs (WAF on TLS/JA3 + client-hint fingerprint); the headless-Chromium transport's realistic fingerprint clears the WAF. Transcripts extracted from `<div data-gtm-section="Podcast transcript">`. |
+| `deutsche_bank`    | n/a                        | **Gap — source-side**. `corporates.db.com/multimedia/podcasts` exposes 2 series hubs (`esg-insights`, `mark-to-market`) but ships **audio only** — no transcripts on the site. Headless walker can reach the page; there is nothing transcriptable to admit until Deutsche Bank publishes transcripts. |
+| `mckinsey`         | n/a                        | **Gap — WAF**. `www.mckinsey.com/featured-insights/mckinsey-podcast` returns an Akamai "Access Denied" page even via headless Chromium with a realistic fingerprint, while sibling paths under `/featured-insights/` work. Akamai is path-scoped against the podcast subpath and our fingerprint is not enough to clear it. Will need a residential-egress proxy (or McKinsey allow-listing our origin) before discovery is possible. |
+| `rics`             | n/a                        | **Gap — source-side**. `rics.org/podcast` renders fully via headless browser but the episode cards link only to external audio players — **no transcripts are published on rics.org**. Crawling cleanly is impossible until RICS adds transcripts. |
+| `ted_worklife`     | n/a                        | **Gap — source-side**. The show migrated off `ted.com`: `/podcasts/worklife` now hosts only outbound links to Spotify / Apple Podcasts / Castbox / Amazon Music / Player.fm. Every episode-page URL pattern (`/podcasts/worklife-with-adam-grant`, `/podcasts/worklife-with-adam-grant/episodes`, etc.) returns TED's 404 page. **Transcripts are not hosted on ted.com.** |
+| `thomson_reuters`  | n/a                        | **Gap — source-side**. `www.thomsonreuters.com/en/insights/podcasts` and `legal.thomsonreuters.com/blog/category/podcasts/` both return Thomson Reuters' "Page not found" template. **No podcast presence located on the corporate site** after Tranche 1 reconnaissance. |
 
-The seven "Gap" rows are the publishers where a single follow-up
-work item (headless browser walker, residential proxy, or
-manually-curated seed list updated periodically) is needed to
-unlock discovery. The architecture supports them — the
-`_discover_episode_slugs` hook is there and the rest of the
-pipeline is publisher-agnostic — they just don't have a working
-discovery channel yet from this network egress.
+The five remaining `Gap` rows split into two categories — and
+the split matters for triage:
+
+* **Source-side gaps** (`deutsche_bank`, `rics`, `ted_worklife`,
+  `thomson_reuters`): the source does not publish transcripts on
+  the URLs we expected. `deutsche_bank` ships audio only;
+  `rics` links out to external audio players; `ted_worklife` and
+  `thomson_reuters` have removed their podcast presence from the
+  corporate site entirely. No technical change to the crawler
+  will close these — they're blocked on the publisher.
+* **WAF gaps** (`mckinsey`): Akamai still 403s the specific
+  podcast subpath even with a realistic browser fingerprint.
+  Closing this requires a residential-egress proxy or an explicit
+  origin allow-listing by McKinsey.
+
+The architecture supports both shapes — `_discover_episode_slugs`
+is there, the headless-browser transport is wired in (see
+`crawl/crawlers/_browser.py`), and the rest of the pipeline is
+publisher-agnostic. Closing the remaining gaps requires changes
+on the source side (or a different network egress for McKinsey),
+not in this codebase.
 
 ## Adding a new source
 

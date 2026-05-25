@@ -11,6 +11,19 @@ lxml>=5.2,<6
 # Microsoft Cyber transcripts ship as PDFs).
 pdfminer.six>=20240706
 
+# Headless browser transport for publishers whose discovery /
+# episode pages are React / Next.js / Drupal SPAs (RBC
+# Disruptors) or sit behind a WAF rule that rejects plain
+# requests-shaped TLS fingerprints (WEF Radio Davos). Used only
+# by the ``crawl.crawlers._browser`` module; crawlers that don't
+# need a headless browser never import Playwright at all.
+#
+# A successful Playwright install also requires the matching
+# Chromium build, which is downloaded out-of-band by
+# ``python -m playwright install chromium`` (added to the repo
+# setup steps). CI caches the resulting browser binaries.
+playwright>=1.41,<2
+
 # Content-hash for the chunk dedup gate. Pinned as a hard
 # dependency (not an optional fallback to SHA-256) so a host
 # without the blake3 wheel cannot produce a different digest from
