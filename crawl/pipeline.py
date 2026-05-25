@@ -1,0 +1,365 @@
+"""sn-mdm crawl orchestrator.
+
+The pipeline drives every concrete crawler through the canonical
+stages:
+
+    crawl -> rights_gate -> normalize -> chunk -> tag -> metadata_emit -> governance_log
+
+The three ingestion invariants from the research are enforced
+here, not in the per-source crawlers:
+
+1. **Rights gate before chunking.** Episodes whose ``rights_code``
+   is not in the configured allowlist are recorded in the
+   governance log with ``deprecated = True`` and their chunks are
+   never written. This matches the Rust ``PackStore::ingest_episode``
+   gate, so re-running ingest never resurfaces rejected episodes.
+
+2. **Chunk by speaker turn and section heading.** Implemented inside
+   :func:`crawl.crawlers.base.chunk_normalised_text` — the pipeline
+   delegates here.
+
+3. **Companion-resource links.** Crawlers extract these into
+   :attr:`crawl.crawlers.base.RawEpisode.asset_urls` and the
+   pipeline persists them onto the JSONL episode line so chunks
+   can point to the deeper resource at query time.
+
+The pipeline is idempotent: re-running on already-processed
+episodes skips them via the ``content_hash`` audit trail, so an
+operator can re-crawl any time without producing duplicates.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .crawlers import get_crawler, known_publishers
+from .crawlers.base import (
+    DEFAULT_OVERLAP_TOKENS,
+    DEFAULT_TARGET_TOKENS,
+    BaseCrawler,
+    CrawlerConfig,
+    NormalisedEpisode,
+    RawEpisode,
+)
+
+try:  # Python 3.11+
+    import tomllib
+except ImportError:  # pragma: no cover - Python 3.10 path
+    import tomli as tomllib  # type: ignore[import-not-found]
+
+
+LOG = logging.getLogger("sn_mdm.pipeline")
+
+
+DEFAULT_RIGHTS_ALLOWLIST: tuple[str, ...] = (
+    "ogl_v3",
+    "cc_by",
+    "cc_by_sa",
+    "cc_by_nc",
+    "cc_by_nc_nd",
+    "free_access_copyrighted",
+    "public_domain",
+)
+"""Mirror of ``pack_core::ingest::DEFAULT_RIGHTS_ALLOWLIST``."""
+
+
+@dataclass
+class PublisherStats:
+    """Per-publisher tally returned from :meth:`Pipeline.run_publisher`."""
+
+    publisher_id: str
+    episodes_seen: int = 0
+    episodes_admitted: int = 0
+    episodes_rejected_rights: int = 0
+    episodes_skipped_dedup: int = 0
+    chunks_emitted: int = 0
+
+
+@dataclass
+class PipelineReport:
+    """Aggregate report across all publishers in a pipeline run."""
+
+    by_publisher: dict[str, PublisherStats] = field(default_factory=dict)
+
+    def totals(self) -> PublisherStats:
+        out = PublisherStats(publisher_id="__totals__")
+        for s in self.by_publisher.values():
+            out.episodes_seen += s.episodes_seen
+            out.episodes_admitted += s.episodes_admitted
+            out.episodes_rejected_rights += s.episodes_rejected_rights
+            out.episodes_skipped_dedup += s.episodes_skipped_dedup
+            out.chunks_emitted += s.chunks_emitted
+        return out
+
+
+class Pipeline:
+    """The orchestrator. Holds the registry-derived ``CrawlerConfig``
+    objects, the packs root, and the rights allowlist. Designed to
+    be re-used across publishers in a single run so the in-process
+    governance log can accumulate.
+    """
+
+    def __init__(
+        self,
+        configs: dict[str, CrawlerConfig],
+        packs_root: Path,
+        rights_allowlist: tuple[str, ...] = DEFAULT_RIGHTS_ALLOWLIST,
+    ) -> None:
+        self.configs = configs
+        self.packs_root = Path(packs_root)
+        self.rights_allowlist = {code.lower() for code in rights_allowlist}
+        # Map content_hash -> episode_id so re-crawls collapse on
+        # already-seen content (third invariant from the research).
+        self._seen_content_hashes: set[str] = set()
+        self._load_known_hashes()
+
+    # -- public surface --------------------------------------------------
+
+    def run(self, publisher_ids: list[str] | None = None) -> PipelineReport:
+        """Run every configured publisher (or just the requested
+        subset).
+        """
+        targets = publisher_ids or sorted(self.configs)
+        report = PipelineReport()
+        for pid in targets:
+            if pid not in self.configs:
+                LOG.warning("no config for publisher_id=%s; skipping", pid)
+                continue
+            report.by_publisher[pid] = self.run_publisher(pid)
+        return report
+
+    def run_publisher(self, publisher_id: str) -> PublisherStats:
+        config = self.configs[publisher_id]
+        crawler_cls = get_crawler(publisher_id)
+        crawler = crawler_cls(config=config, packs_root=self.packs_root)
+        stats = PublisherStats(publisher_id=publisher_id)
+
+        metadata_path = crawler.open_jsonl("metadata")
+        chunks_path = crawler.open_jsonl("chunks")
+        governance_path = self.packs_root / "governance" / "rights_log.jsonl"
+        governance_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with (
+            metadata_path.open("a", encoding="utf-8") as metadata_fp,
+            chunks_path.open("a", encoding="utf-8") as chunks_fp,
+            governance_path.open("a", encoding="utf-8") as gov_fp,
+        ):
+            for raw in self._iter_episodes(crawler):
+                stats.episodes_seen += 1
+                # Rights gate — runs BEFORE normalisation so a
+                # rejected source is never even chunked. Keeps the
+                # contract identical to the Rust ``PackStore``.
+                gate_ok = self._rights_gate_allows(config.rights_code)
+                if not gate_ok:
+                    stats.episodes_rejected_rights += 1
+                    normalised = self._best_effort_normalise(crawler, raw)
+                    self._write_governance(
+                        gov_fp, crawler, normalised, deprecated=True
+                    )
+                    continue
+
+                crawler.save_raw(raw)
+                normalised = crawler.normalize(raw)
+                if normalised.content_hash in self._seen_content_hashes:
+                    stats.episodes_skipped_dedup += 1
+                    continue
+                self._seen_content_hashes.add(normalised.content_hash)
+                crawler.save_normalised(normalised)
+
+                episode_dict = crawler.emit_episode(normalised)
+                metadata_fp.write(json.dumps(episode_dict, ensure_ascii=False) + "\n")
+                metadata_fp.flush()
+
+                chunks = crawler.chunk(normalised)
+                for chunk_dict in crawler.emit_chunks(normalised, chunks):
+                    chunks_fp.write(json.dumps(chunk_dict, ensure_ascii=False) + "\n")
+                    stats.chunks_emitted += 1
+                chunks_fp.flush()
+
+                self._write_governance(gov_fp, crawler, normalised, deprecated=False)
+                stats.episodes_admitted += 1
+        return stats
+
+    # -- internals -------------------------------------------------------
+
+    def _iter_episodes(self, crawler: BaseCrawler) -> list[RawEpisode]:
+        # Materialise to a list so the iteration order is
+        # deterministic across runs (the crawler's own generators
+        # are deterministic but `list(...)` makes the contract
+        # obvious in tracebacks).
+        episodes: list[RawEpisode] = []
+        for raw in crawler.initial_sync():
+            episodes.append(raw)
+        return episodes
+
+    def _rights_gate_allows(self, rights_code: str) -> bool:
+        return rights_code.lower() in self.rights_allowlist
+
+    def _best_effort_normalise(
+        self, crawler: BaseCrawler, raw: RawEpisode
+    ) -> NormalisedEpisode:
+        """Run :meth:`normalize` on a rights-rejected episode so the
+        governance log can still record a stable content_hash.
+        Failures are swallowed (rejection has already happened —
+        we don't fail the run because the audit log couldn't hash
+        the body).
+        """
+        try:
+            return crawler.normalize(raw)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("best-effort normalise failed for %s: %s", raw.episode_slug, exc)
+            return NormalisedEpisode(
+                raw=raw,
+                normalised_markdown="",
+                content_hash="0" * 64,
+            )
+
+    def _write_governance(
+        self,
+        fp: Any,
+        crawler: BaseCrawler,
+        normalised: NormalisedEpisode,
+        *,
+        deprecated: bool,
+    ) -> None:
+        entry = crawler.emit_governance_entry(normalised, deprecated=deprecated)
+        fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        fp.flush()
+
+    def _load_known_hashes(self) -> None:
+        gov = self.packs_root / "governance" / "rights_log.jsonl"
+        if not gov.exists():
+            return
+        with gov.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ch = rec.get("content_hash")
+                # Don't carry rejection hashes forward — a re-crawl
+                # could later succeed under a different rights code.
+                if isinstance(ch, str) and ch and not rec.get("deprecated"):
+                    self._seen_content_hashes.add(ch)
+
+
+# ------------------------------------------------------------------
+# Source-registry loader
+# ------------------------------------------------------------------
+
+
+def load_config(path: Path) -> dict[str, CrawlerConfig]:
+    """Parse ``crawl_config.toml`` into a dict of
+    :class:`CrawlerConfig`. Unknown publishers raise ``KeyError``
+    (so the operator notices an unregistered crawler at boot, not
+    at run-time).
+    """
+    with path.open("rb") as fp:
+        raw = tomllib.load(fp)
+    sources = raw.get("sources", {})
+    configs: dict[str, CrawlerConfig] = {}
+    for pid, body in sources.items():
+        if pid not in known_publishers():
+            raise KeyError(
+                f"crawl_config.toml lists publisher_id={pid!r} but no crawler is registered; "
+                f"known: {known_publishers()}"
+            )
+        # Defensive defaults — let operators omit empty fields.
+        configs[pid] = CrawlerConfig(
+            publisher_id=pid,
+            publisher_name=body.get("publisher_name", pid),
+            base_url=body.get("base_url", ""),
+            rights_code=body.get("rights_code", "unknown"),
+            rights_summary=body.get("rights_summary", ""),
+            country_region=list(body.get("country_region", [])),
+            industry_tags=list(body.get("industry_tags", [])),
+            function_tags=list(body.get("function_tags", [])),
+            business_model_tags=list(body.get("business_model_tags", [])),
+            source_type=body.get("source_type", "podcast_transcript_html"),
+            language=body.get("language", "en"),
+            series_id=body.get("series_id", "flagship"),
+            series_title=body.get("series_title", body.get("publisher_name", pid)),
+            host=body.get("host", ""),
+            primary_series_url=body.get("primary_series_url", ""),
+            episodes=list(body.get("episodes", [])),
+            credibility_notes=body.get("credibility_notes", ""),
+            chunking_policy={
+                "target_tokens": int(
+                    body.get("chunking_policy", {}).get("target_tokens", DEFAULT_TARGET_TOKENS)
+                ),
+                "overlap_tokens": int(
+                    body.get("chunking_policy", {}).get("overlap_tokens", DEFAULT_OVERLAP_TOKENS)
+                ),
+            },
+        )
+    return configs
+
+
+# ------------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m crawl.pipeline",
+        description=(
+            "Drive sn-mdm crawlers through the canonical "
+            "crawl -> rights-gate -> normalize -> chunk -> tag pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).resolve().parent / "crawl_config.toml",
+        help="Path to the source registry TOML.",
+    )
+    parser.add_argument(
+        "--packs-root",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent / "packs",
+        help="Output root for raw/, normalized/, metadata/, chunks/, governance/.",
+    )
+    parser.add_argument(
+        "publishers",
+        nargs="*",
+        help="Subset of publisher ids to run. Defaults to every registered publisher.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    configs = load_config(args.config)
+    pipeline = Pipeline(configs=configs, packs_root=args.packs_root)
+    report = pipeline.run(args.publishers or None)
+    totals = report.totals()
+    LOG.info(
+        "pipeline complete: %d seen, %d admitted, %d rejected, %d deduped, %d chunks",
+        totals.episodes_seen,
+        totals.episodes_admitted,
+        totals.episodes_rejected_rights,
+        totals.episodes_skipped_dedup,
+        totals.chunks_emitted,
+    )
+    # Non-zero exit if every publisher failed to admit anything —
+    # that's almost certainly a crawl regression.
+    if totals.episodes_seen > 0 and totals.episodes_admitted == 0 and totals.episodes_rejected_rights == 0:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
+    sys.exit(main())

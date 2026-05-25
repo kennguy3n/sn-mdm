@@ -1,0 +1,30 @@
+# Lint configuration for the sn-mdm crawl layer.
+# Project metadata lives in `requirements.txt` (the crawl scripts are
+# not packaged as a distributable — they run from a checkout).
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["__pycache__", ".venv", "venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "SIM",  # simplifications
+]
+ignore = [
+    # We use long URL constants in source registries — line-length
+    # would flag these as `E501`.
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # assert False is fine in tests.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

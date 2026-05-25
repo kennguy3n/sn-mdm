@@ -1,0 +1,25 @@
+# Runtime dependencies for the sn-mdm crawl layer.
+# Pinned to ranges that have shipped together for >12 months so the
+# CI snapshot stays reproducible without lock-file drift.
+
+# HTTP + HTML parsing
+requests>=2.32,<3
+beautifulsoup4>=4.12,<5
+lxml>=5.2,<6
+
+# PDF transcript extraction (BCG, McKinsey, Deutsche Bank,
+# Microsoft Cyber transcripts ship as PDFs).
+pdfminer.six>=20240706
+
+# robots.txt parsing
+urllib3>=2.2,<3
+
+# Toml parsing — Python 3.11+ ships tomllib in the stdlib, but the
+# package still needs to support 3.10 for older host environments.
+tomli>=2.0,<3; python_version < "3.11"
+
+# Test framework
+pytest>=8.2,<9
+
+# Lint / format
+ruff>=0.6,<1
