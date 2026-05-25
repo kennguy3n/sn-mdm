@@ -639,10 +639,26 @@ class BaseCrawler:
         crawlers don't need to thread the policy through.
         """
         policy = self.config.chunking_policy
+        # Use ``is not None`` rather than truthiness so an explicit
+        # ``overlap_tokens=0`` ("no overlap") is honoured instead of
+        # silently falling through to the policy default. The
+        # ``chunk_normalised_text`` validator at line ~290 already
+        # enforces ``target_tokens > 0`` and ``overlap_tokens >= 0``,
+        # so a zero overlap is a real, supported value.
+        effective_target = (
+            target_tokens
+            if target_tokens is not None
+            else policy.get("target_tokens", DEFAULT_TARGET_TOKENS)
+        )
+        effective_overlap = (
+            overlap_tokens
+            if overlap_tokens is not None
+            else policy.get("overlap_tokens", DEFAULT_OVERLAP_TOKENS)
+        )
         return chunk_normalised_text(
             normalised.normalised_markdown,
-            target_tokens=target_tokens or policy.get("target_tokens", DEFAULT_TARGET_TOKENS),
-            overlap_tokens=overlap_tokens or policy.get("overlap_tokens", DEFAULT_OVERLAP_TOKENS),
+            target_tokens=effective_target,
+            overlap_tokens=effective_overlap,
         )
 
     # -- emit ------------------------------------------------------------

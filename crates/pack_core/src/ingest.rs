@@ -353,7 +353,19 @@ impl PackStore {
         }
 
         let now = Utc::now().timestamp();
-        self.conn
+        // Run the chunk-row INSERT and the FTS5 INSERT inside the
+        // same transaction so a primary-key collision on
+        // ``chunk_id`` (re-crawl of an existing chunk_id with newly
+        // *different* text — the content-hash dedup at line 346
+        // already caught the same-text case) cannot leave the FTS5
+        // index pointing at a row that wasn't actually written. The
+        // ``INSERT OR IGNORE`` returns a row count of 0 on the PK
+        // collision and we then bail out with ``Ok(false)`` *before*
+        // touching ``chunk_fts``, so the index never gains an
+        // orphan entry and the caller's "inserted" counter stays
+        // accurate.
+        let tx = self.conn.unchecked_transaction()?;
+        let inserted = tx
             .prepare_cached(
                 r#"INSERT OR IGNORE INTO chunk
                   (chunk_id, episode_id, section_heading, chunk_text,
@@ -370,13 +382,23 @@ impl PackStore {
                 hash.as_bytes(),
                 now,
             ])?;
+        if inserted == 0 {
+            // Same ``chunk_id``, different text: the content-hash
+            // dedup at line 346 did *not* short-circuit (new text
+            // → new hash), but the unique-PK trigger on
+            // ``chunk.chunk_id`` rejected the row. Skip the FTS5
+            // insert and report ``Ok(false)`` so the caller's
+            // stats reflect the no-op. The transaction's drop is
+            // a rollback, which is what we want here.
+            return Ok(false);
+        }
 
-        self.conn
-            .prepare_cached(
-                r#"INSERT INTO chunk_fts (chunk_text, chunk_id, episode_id)
+        tx.prepare_cached(
+            r#"INSERT INTO chunk_fts (chunk_text, chunk_id, episode_id)
                   VALUES (?, ?, ?)"#,
-            )?
-            .execute(params![chunk.chunk_text, chunk.chunk_id, chunk.episode_id])?;
+        )?
+        .execute(params![chunk.chunk_text, chunk.chunk_id, chunk.episode_id])?;
+        tx.commit()?;
         Ok(true)
     }
 
@@ -681,5 +703,58 @@ mod tests {
             .conn
             .execute("UPDATE episode SET title = 'changed'", []);
         assert!(res.is_err(), "trigger should reject UPDATE");
+    }
+
+    #[test]
+    fn duplicate_chunk_id_with_different_text_does_not_leave_fts_orphan() {
+        // Regression: a re-crawl that produces the same ``chunk_id``
+        // with newly *different* text used to fall through the
+        // content-hash dedup (new text → new hash) but get rejected
+        // by ``INSERT OR IGNORE INTO chunk`` (PK collision) — and
+        // the FTS5 insert ran anyway, leaving a phantom entry that
+        // pointed at stale text.
+        let store = PackStore::open_in_memory().expect("open");
+        let ep = sample_episode("acquired_flagship_costco", "free_access_copyrighted");
+        store.ingest_episode(&ep).unwrap();
+        let original = Chunk {
+            chunk_id: "acquired_flagship_costco#0001".into(),
+            episode_id: ep.episode_id.clone(),
+            token_count: 12,
+            section_heading: Some("Introduction".into()),
+            chunk_text: "BEN: Costco's flywheel works because of the membership.".into(),
+            citation_anchor: format!("{}#section-1", ep.primary_url),
+        };
+        assert!(store.ingest_chunk(&original).unwrap());
+
+        // Same ``chunk_id``, edited text (different hash).
+        let edited = Chunk {
+            chunk_text: "BEN: Costco's flywheel works because of cheap-rotisserie scale.".into(),
+            ..original.clone()
+        };
+        assert!(
+            !store.ingest_chunk(&edited).unwrap(),
+            "second ingest must report no-op",
+        );
+
+        // Exactly one chunk row, exactly one FTS5 row, and the FTS5
+        // row points at the original text — not at the edit.
+        assert_eq!(store.chunk_count().unwrap(), 1);
+        let fts_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunk_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1, "FTS5 must not have an orphan row");
+        let fts_text: String = store
+            .conn
+            .query_row(
+                "SELECT chunk_text FROM chunk_fts WHERE chunk_id = ?",
+                params![original.chunk_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fts_text, original.chunk_text,
+            "FTS5 row must still point at the original text",
+        );
     }
 }

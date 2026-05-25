@@ -28,7 +28,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          # Include Cargo.lock so a dependency bump (which only
+          # touches Cargo.lock, not Cargo.toml) invalidates the
+          # cache and rebuilds against the new resolved versions.
+          # ``restore-keys`` still lets us reuse the registry / git
+          # caches across builds, so the cost is only a recompile
+          # of the dependency tree, not a re-download.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 

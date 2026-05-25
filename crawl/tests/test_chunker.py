@@ -126,6 +126,66 @@ def test_chunker_rejects_bad_policy() -> None:
         chunk_normalised_text("hi", target_tokens=100, overlap_tokens=200)
 
 
+def test_base_crawler_chunk_honours_explicit_zero_overlap(tmp_path) -> None:
+    # Regression: ``BaseCrawler.chunk(overlap_tokens=0, ...)`` used
+    # to silently fall through to the policy default (120) because
+    # ``0`` is falsy in Python. The fix uses ``is not None`` so an
+    # explicit zero is honoured. We assert this by spying on the
+    # call to ``chunk_normalised_text`` from inside ``chunk``.
+    from unittest.mock import patch
+
+    from crawl.crawlers.base import (
+        BaseCrawler,
+        CrawlerConfig,
+        NormalisedEpisode,
+        RawEpisode,
+    )
+
+    config = CrawlerConfig(
+        publisher_id="fake",
+        publisher_name="Fake",
+        base_url="https://example.com",
+        rights_code="free_access_copyrighted",
+        rights_summary="",
+        chunking_policy={"target_tokens": 700, "overlap_tokens": 120},
+    )
+    crawler = BaseCrawler.__new__(BaseCrawler)
+    crawler.config = config
+    raw = RawEpisode(
+        episode_slug="hello",
+        title="Hello",
+        primary_url="https://example.com/hello",
+        publication_date="2024-01-01",
+        raw_bytes=b"",
+        content_type="text/html",
+    )
+    normalised = NormalisedEpisode(raw=raw, normalised_markdown="SIMON: hi", content_hash="x")
+
+    captured: dict[str, int] = {}
+
+    def fake_chunk(text, *, target_tokens, overlap_tokens):
+        captured["target_tokens"] = target_tokens
+        captured["overlap_tokens"] = overlap_tokens
+        return []
+
+    with patch("crawl.crawlers.base.chunk_normalised_text", fake_chunk):
+        crawler.chunk(normalised, target_tokens=300, overlap_tokens=0)
+
+    # Explicit ``overlap_tokens=0`` must arrive at the chunker as
+    # 0, NOT silently rewritten to the policy default of 120.
+    assert captured["target_tokens"] == 300
+    assert captured["overlap_tokens"] == 0
+
+    # And ``None`` (or the parameter being omitted) still falls
+    # back to the policy default — that part of the contract is
+    # unchanged.
+    captured.clear()
+    with patch("crawl.crawlers.base.chunk_normalised_text", fake_chunk):
+        crawler.chunk(normalised)
+    assert captured["target_tokens"] == 700
+    assert captured["overlap_tokens"] == 120
+
+
 def test_oversize_turn_carries_overlap_into_next_turn() -> None:
     # Regression: an earlier version of the oversize-turn branch
     # reset the overlap buffer to empty after windowing a single
