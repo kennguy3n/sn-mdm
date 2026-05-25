@@ -380,6 +380,20 @@ class Pipeline:
         # registered publishers share a prefix, so the order
         # doesn't matter; the sort is defence-in-depth for future
         # additions.
+        #
+        # Orphaned-prefix note: if a publisher previously wrote
+        # governance entries and is later *removed* from
+        # ``self.configs``, its ``episode_id``s are silently
+        # dropped here (no prefix matches, no break, the loop
+        # falls off the end). That's the right behaviour for the
+        # incremental gate — a publisher that no longer exists in
+        # the registry has no crawler to skip slugs for, so
+        # forwarding its ids would just inflate the in-memory
+        # map for nothing. The orphaned content_hash entries
+        # above are still loaded into ``_seen_content_hashes``
+        # because that gate is publisher-agnostic: a
+        # re-introduction of the same content via a different
+        # publisher should still dedup.
         prefixes = sorted(
             ((pid, f"{pid}_") for pid in self.configs),
             key=lambda kv: len(kv[1]),

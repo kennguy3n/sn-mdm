@@ -946,6 +946,21 @@ class BaseCrawler:
         The pipeline reads this so :class:`PublisherStats` can
         report ``episodes_skipped_incremental`` alongside the
         rights-gate and dedup short-circuit counters.
+
+        Override pattern: this base implementation enumerates
+        slugs via :meth:`_enumerate_slugs`, which composes
+        ``config.episodes`` (seeds) and :meth:`_discover_episode_slugs`
+        (the conventional discovery extension point). Every
+        production crawler today follows that pattern, so the
+        base ``incremental_sync`` works for all of them without
+        modification. If a future crawler overrides
+        :meth:`initial_sync` directly (e.g. to drive enumeration
+        from an API that doesn't fit the slug abstraction), it
+        MUST also override :meth:`incremental_sync` so the
+        cursor-aware skip still fires — otherwise the override
+        crawler would silently fall through to the base, which
+        only knows about the standard ``_discover_episode_slugs``
+        path and would mis-enumerate the catalogue.
         """
         known = frozenset(known_episode_ids or ())
         self.last_incremental_skip_count = 0

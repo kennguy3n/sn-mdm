@@ -382,7 +382,19 @@ class DiscoveryMergeCrawler(BaseCrawler):
     def normalize(self, raw):  # type: ignore[override]
         from crawl.crawlers.base import canonicalise_text, content_hash
 
-        text = canonicalise_text("# title\n\nX: y")
+        # Include the slug in the canonical text so each episode
+        # produces a *distinct* content_hash. The previous fixture
+        # hard-coded ``"# title\n\nX: y"`` for every slug, which
+        # meant the content-hash dedup gate would silently absorb
+        # all-but-one of any multi-episode admit. That was fine
+        # for the seed/discovery enumeration tests (they only
+        # exercise ``initial_sync()`` and assert on
+        # ``crawler.fetched``), but for pipeline-level coverage
+        # we want the dedup gate to be inert so each test really
+        # exercises the admit path it claims to.
+        text = canonicalise_text(
+            f"# {raw.episode_slug}\n\nX: transcript for {raw.episode_slug}"
+        )
         return NormalisedEpisode(raw=raw, normalised_markdown=text, content_hash=content_hash(text))
 
 
@@ -787,8 +799,16 @@ def test_pipeline_incremental_skip_count_rolls_into_stats(
     )
     report = pipeline.run(["predisc"])
     stats = report.by_publisher["predisc"]
-    # Two slugs reached the fetcher (s-1, d-2), one was skipped (d-1).
+    # Three slugs enumerated (s-1, d-1, d-2); d-1 was skipped via
+    # the cursor, s-1 and d-2 both reached the fetcher and the
+    # admit path. The fixture's ``normalize`` produces a distinct
+    # ``content_hash`` per slug so the dedup gate is inert here
+    # — both s-1 and d-2 land as fresh admits, proving the
+    # incremental flow doesn't accidentally rely on the dedup
+    # gate to mask the missing skip arithmetic.
     assert stats.episodes_seen == 2
+    assert stats.episodes_admitted == 2
+    assert stats.episodes_skipped_dedup == 0
     assert stats.episodes_skipped_incremental == 1
 
 
