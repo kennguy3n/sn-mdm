@@ -644,10 +644,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Steady-state mode. Skip slugs whose canonical episode_id is "
-            "already present (non-deprecated) in the governance log, so the "
-            "crawler avoids re-fetching transcripts the pack already has. "
-            "Default mode runs the full discovery + transcript fetch loop and "
-            "relies on the content_hash gate to skip duplicates *after* the "
+            "already known from the governance log, BEFORE the transcript "
+            "fetch. 'Known' means either (a) previously admitted (the pack "
+            "already has it) or (b) previously rejected by the rights gate "
+            "AND the recorded rights_code is still outside the current "
+            "rights_allowlist (re-fetching would only re-reject and append "
+            "another deprecated row). Episodes whose rights_code is now in "
+            "the allowlist (operator extended the allowlist between runs) "
+            "are NOT skipped, so the new policy can take effect. Default "
+            "mode runs the full discovery + transcript fetch loop and "
+            "relies on the content_hash gate to skip duplicates AFTER the "
             "HTTP fetch."
         ),
     )
