@@ -142,13 +142,20 @@ overlap_tokens = 120
 
 [sources.ted_worklife]
 publisher_name        = "TED"
-base_url              = "https://www.ted.com/podcasts/worklife"
-host                  = "Adam Grant"
+base_url              = "https://www.ted.com/podcasts"
+# Deliberately empty: the WorkLife show has changed hosts (Adam
+# Grant -> Molly Graham) and TED keeps older transcripts under
+# the same hub. Stamping a single "current host" on every
+# metadata row would mis-attribute legacy Adam Grant episodes.
+# emit_episode therefore falls through to an empty list so the
+# only host signal that ships is the speaker labels in the
+# transcript body itself.
+host                  = ""
 series_id             = "worklife"
-series_title          = "WorkLife with Adam Grant"
-primary_series_url    = "https://www.ted.com/podcasts/worklife"
+series_title          = "WorkLife (Adam Grant 2018-2024, Molly Graham 2024-present)"
+primary_series_url    = "https://www.ted.com/podcasts/worklife-transcripts"
 rights_code           = "cc_by_nc_nd"
-rights_summary        = "CC BY-NC-ND 4.0; full transcripts published on ted.com under the WorkLife show."
+rights_summary        = "CC BY-NC-ND 4.0; per-episode transcripts at /podcasts/{slug}-transcript, hub at /podcasts/worklife-transcripts."
 country_region        = ["US", "global"]
 industry_tags         = ["HR", "leadership"]
 function_tags         = ["culture", "hiring", "operations"]
@@ -280,13 +287,13 @@ overlap_tokens = 120
 
 [sources.deutsche_bank]
 publisher_name        = "Deutsche Bank"
-base_url              = "https://corporates.db.com/multimedia"
-host                  = ""
-series_id             = "corporates_podcast"
-series_title          = "Deutsche Bank Corporates Podcast"
-primary_series_url    = "https://corporates.db.com/multimedia"
+base_url              = "https://flow.db.com/media/flow-incorporatetreasury-podcasts"
+host                  = "Clarissa Dann"
+series_id             = "flow_incorporatetreasury"
+series_title          = "flow InCorporate Treasury podcast"
+primary_series_url    = "https://flow.db.com/media/flow-incorporatetreasury-podcasts/"
 rights_code           = "free_access_copyrighted"
-rights_summary        = "Free-access copyrighted; transcripts and companion guides on corporates.db.com."
+rights_summary        = "Free-access copyrighted; verbatim transcripts on flow.db.com at /{episode-slug}-transcript companion permalinks."
 country_region        = ["Germany", "APAC", "global"]
 industry_tags         = ["banking", "finance", "fintech"]
 function_tags         = ["strategy", "compliance", "operations"]
@@ -349,13 +356,13 @@ overlap_tokens = 120
 
 [sources.thomson_reuters]
 publisher_name        = "Thomson Reuters"
-base_url              = "https://www.thomsonreuters.com/en-us/posts/legal"
+base_url              = "https://www.thomsonreuters.com/en-us/posts"
 host                  = ""
-series_id             = "legal_podcasts"
-series_title          = "Thomson Reuters Legal Podcasts"
-primary_series_url    = "https://www.thomsonreuters.com/en-us/posts/legal"
+series_id             = "thomson_reuters_institute_podcasts"
+series_title          = "Thomson Reuters Institute podcasts"
+primary_series_url    = "https://www.thomsonreuters.com/en-us/posts/post-sitemap.xml"
 rights_code           = "free_access_copyrighted"
-rights_summary        = "Free-access copyrighted; episode transcripts inside legal podcast posts."
+rights_summary        = "Free-access copyrighted; episode transcripts published as PDFs linked from /{category}/podcast-{slug}/ posts."
 country_region        = ["US", "global"]
 industry_tags         = ["legal"]
 function_tags         = ["compliance", "governance"]
