@@ -181,31 +181,33 @@ def test_dedup_skip_does_not_rewrite_raw_file(tmp_path: Path) -> None:
     from crawl import crawlers
 
     crawlers._REGISTRY["fake"] = CountingCrawler  # type: ignore[attr-defined]
+    try:
+        pipeline = Pipeline(
+            configs={"fake": _config("free_access_copyrighted")},
+            packs_root=tmp_path,
+        )
+        pipeline.run(["fake"])
+        assert save_raw_calls == ["hello-world"], (
+            "First run must persist the raw bytes (the file isn't on disk yet)"
+        )
 
-    pipeline = Pipeline(
-        configs={"fake": _config("free_access_copyrighted")},
-        packs_root=tmp_path,
-    )
-    pipeline.run(["fake"])
-    assert save_raw_calls == ["hello-world"], (
-        "First run must persist the raw bytes (the file isn't on disk yet)"
-    )
-
-    # Second pipeline reads the governance log from disk and seeds
-    # ``_seen_content_hashes`` so the second crawl of the same
-    # episode hits the dedup gate.
-    save_raw_calls.clear()
-    pipeline2 = Pipeline(
-        configs={"fake": _config("free_access_copyrighted")},
-        packs_root=tmp_path,
-    )
-    report = pipeline2.run(["fake"])
-    stats = report.by_publisher["fake"]
-    assert stats.episodes_skipped_dedup == 1
-    assert save_raw_calls == [], (
-        "Dedup-skipped episode must not invoke save_raw — otherwise the "
-        "raw cache is wastefully rewritten on every re-crawl."
-    )
+        # Second pipeline reads the governance log from disk and seeds
+        # ``_seen_content_hashes`` so the second crawl of the same
+        # episode hits the dedup gate.
+        save_raw_calls.clear()
+        pipeline2 = Pipeline(
+            configs={"fake": _config("free_access_copyrighted")},
+            packs_root=tmp_path,
+        )
+        report = pipeline2.run(["fake"])
+        stats = report.by_publisher["fake"]
+        assert stats.episodes_skipped_dedup == 1
+        assert save_raw_calls == [], (
+            "Dedup-skipped episode must not invoke save_raw — otherwise the "
+            "raw cache is wastefully rewritten on every re-crawl."
+        )
+    finally:
+        crawlers._REGISTRY.pop("fake", None)
 
 
 def test_default_rights_allowlist_mirrors_pack_core() -> None:
@@ -255,26 +257,29 @@ def test_per_episode_rights_override_admits_when_publisher_blocks(
     from crawl import crawlers
 
     crawlers._REGISTRY["fake"] = PerEpisodeRightsCrawler  # type: ignore[attr-defined]
-    pipeline = Pipeline(
-        configs={"fake": _config("paywalled")},  # publisher-level: blocked
-        packs_root=tmp_path,
-    )
-    report = pipeline.run(["fake"])
-    stats = report.by_publisher["fake"]
-    # One episode admitted (cc_by override), one rejected (no
-    # override, publisher-level paywalled).
-    assert stats.episodes_seen == 2
-    assert stats.episodes_admitted == 1
-    assert stats.episodes_rejected_rights == 1
-    # Metadata line for the admitted episode must carry the
-    # per-episode rights code, not the publisher-level one.
-    metadata = (tmp_path / "metadata" / "fake.jsonl").read_text().strip().splitlines()
-    assert len(metadata) == 1
-    parsed = json.loads(metadata[0])
-    assert parsed["episode_id"].endswith("_allowed")
-    assert parsed["rights_code"] == "cc_by"
-    assert parsed["rights_summary"] == "One-off CC BY guest segment."
-    assert "paywalled" not in DEFAULT_RIGHTS_ALLOWLIST
+    try:
+        pipeline = Pipeline(
+            configs={"fake": _config("paywalled")},  # publisher-level: blocked
+            packs_root=tmp_path,
+        )
+        report = pipeline.run(["fake"])
+        stats = report.by_publisher["fake"]
+        # One episode admitted (cc_by override), one rejected (no
+        # override, publisher-level paywalled).
+        assert stats.episodes_seen == 2
+        assert stats.episodes_admitted == 1
+        assert stats.episodes_rejected_rights == 1
+        # Metadata line for the admitted episode must carry the
+        # per-episode rights code, not the publisher-level one.
+        metadata = (tmp_path / "metadata" / "fake.jsonl").read_text().strip().splitlines()
+        assert len(metadata) == 1
+        parsed = json.loads(metadata[0])
+        assert parsed["episode_id"].endswith("_allowed")
+        assert parsed["rights_code"] == "cc_by"
+        assert parsed["rights_summary"] == "One-off CC BY guest segment."
+        assert "paywalled" not in DEFAULT_RIGHTS_ALLOWLIST
+    finally:
+        crawlers._REGISTRY.pop("fake", None)
 
 
 def test_exit_code_zero_on_fresh_admit() -> None:
@@ -869,9 +874,6 @@ def test_pipeline_load_known_episode_ids_prefers_explicit_publisher_id(
         def fetch_transcript(self, slug):  # type: ignore[override]
             raise NotImplementedError
 
-    crawlers._REGISTRY["foo"] = _FooCrawler  # type: ignore[attr-defined]
-    crawlers._REGISTRY["foo_bar"] = _FooBarCrawler  # type: ignore[attr-defined]
-
     def _cfg(pid: str, series: str) -> CrawlerConfig:
         base = _config()
         return CrawlerConfig(
@@ -921,15 +923,21 @@ def test_pipeline_load_known_episode_ids_prefers_explicit_publisher_id(
         )
         + "\n"
     )
-    pipeline = Pipeline(
-        configs={"foo": _cfg("foo", "bar"), "foo_bar": _cfg("foo_bar", "flagship")},
-        packs_root=tmp_path,
-        incremental=True,
-    )
-    assert pipeline._known_ids_for("foo") == frozenset({"foo_bar_collision-1"})
-    assert pipeline._known_ids_for("foo_bar") == frozenset(
-        {"foo_bar_flagship_episode-1"}
-    )
+    crawlers._REGISTRY["foo"] = _FooCrawler  # type: ignore[attr-defined]
+    crawlers._REGISTRY["foo_bar"] = _FooBarCrawler  # type: ignore[attr-defined]
+    try:
+        pipeline = Pipeline(
+            configs={"foo": _cfg("foo", "bar"), "foo_bar": _cfg("foo_bar", "flagship")},
+            packs_root=tmp_path,
+            incremental=True,
+        )
+        assert pipeline._known_ids_for("foo") == frozenset({"foo_bar_collision-1"})
+        assert pipeline._known_ids_for("foo_bar") == frozenset(
+            {"foo_bar_flagship_episode-1"}
+        )
+    finally:
+        crawlers._REGISTRY.pop("foo", None)
+        crawlers._REGISTRY.pop("foo_bar", None)
 
 
 def test_pipeline_incremental_skip_count_rolls_into_stats(
@@ -959,59 +967,61 @@ def test_pipeline_incremental_skip_count_rolls_into_stats(
             )
 
     crawlers._REGISTRY["predisc"] = _PreDiscoveredCrawler  # type: ignore[attr-defined]
-
-    cfg = _merge_config(seeds=["s-1"])
-    cfg = CrawlerConfig(
-        publisher_id="predisc",
-        publisher_name=cfg.publisher_name,
-        base_url=cfg.base_url,
-        rights_code=cfg.rights_code,
-        rights_summary=cfg.rights_summary,
-        country_region=cfg.country_region,
-        industry_tags=cfg.industry_tags,
-        function_tags=cfg.function_tags,
-        business_model_tags=cfg.business_model_tags,
-        source_type=cfg.source_type,
-        language=cfg.language,
-        host=cfg.host,
-        episodes=["s-1"],
-    )
-
-    # Pre-seed governance log with one of the discovered ids so
-    # the incremental skip fires for that slug.
-    gov = tmp_path / "governance" / "rights_log.jsonl"
-    gov.parent.mkdir(parents=True, exist_ok=True)
-    gov.write_text(
-        json.dumps(
-            {
-                "episode_id": "predisc_flagship_d-1",
-                "rights_code": "free_access_copyrighted",
-                "ingestion_date": 1700000000,
-                "content_hash": "h-d-1",
-                "deprecated": False,
-            }
+    try:
+        cfg = _merge_config(seeds=["s-1"])
+        cfg = CrawlerConfig(
+            publisher_id="predisc",
+            publisher_name=cfg.publisher_name,
+            base_url=cfg.base_url,
+            rights_code=cfg.rights_code,
+            rights_summary=cfg.rights_summary,
+            country_region=cfg.country_region,
+            industry_tags=cfg.industry_tags,
+            function_tags=cfg.function_tags,
+            business_model_tags=cfg.business_model_tags,
+            source_type=cfg.source_type,
+            language=cfg.language,
+            host=cfg.host,
+            episodes=["s-1"],
         )
-        + "\n"
-    )
 
-    pipeline = Pipeline(
-        configs={"predisc": cfg},
-        packs_root=tmp_path,
-        incremental=True,
-    )
-    report = pipeline.run(["predisc"])
-    stats = report.by_publisher["predisc"]
-    # Three slugs enumerated (s-1, d-1, d-2); d-1 was skipped via
-    # the cursor, s-1 and d-2 both reached the fetcher and the
-    # admit path. The fixture's ``normalize`` produces a distinct
-    # ``content_hash`` per slug so the dedup gate is inert here
-    # — both s-1 and d-2 land as fresh admits, proving the
-    # incremental flow doesn't accidentally rely on the dedup
-    # gate to mask the missing skip arithmetic.
-    assert stats.episodes_seen == 2
-    assert stats.episodes_admitted == 2
-    assert stats.episodes_skipped_dedup == 0
-    assert stats.episodes_skipped_incremental == 1
+        # Pre-seed governance log with one of the discovered ids so
+        # the incremental skip fires for that slug.
+        gov = tmp_path / "governance" / "rights_log.jsonl"
+        gov.parent.mkdir(parents=True, exist_ok=True)
+        gov.write_text(
+            json.dumps(
+                {
+                    "episode_id": "predisc_flagship_d-1",
+                    "rights_code": "free_access_copyrighted",
+                    "ingestion_date": 1700000000,
+                    "content_hash": "h-d-1",
+                    "deprecated": False,
+                }
+            )
+            + "\n"
+        )
+
+        pipeline = Pipeline(
+            configs={"predisc": cfg},
+            packs_root=tmp_path,
+            incremental=True,
+        )
+        report = pipeline.run(["predisc"])
+        stats = report.by_publisher["predisc"]
+        # Three slugs enumerated (s-1, d-1, d-2); d-1 was skipped via
+        # the cursor, s-1 and d-2 both reached the fetcher and the
+        # admit path. The fixture's ``normalize`` produces a distinct
+        # ``content_hash`` per slug so the dedup gate is inert here
+        # — both s-1 and d-2 land as fresh admits, proving the
+        # incremental flow doesn't accidentally rely on the dedup
+        # gate to mask the missing skip arithmetic.
+        assert stats.episodes_seen == 2
+        assert stats.episodes_admitted == 2
+        assert stats.episodes_skipped_dedup == 0
+        assert stats.episodes_skipped_incremental == 1
+    finally:
+        crawlers._REGISTRY.pop("predisc", None)
 
 
 def test_pipeline_in_memory_skip_set_updates_after_admission(
@@ -1071,27 +1081,30 @@ def test_pipeline_in_memory_skip_set_updates_after_rights_rejection(
     from crawl import crawlers
 
     crawlers._REGISTRY["fake"] = PerEpisodeRightsCrawler  # type: ignore[attr-defined]
-    pipeline = Pipeline(
-        configs={"fake": _config("paywalled")},  # publisher-level: blocked
-        packs_root=tmp_path,
-        incremental=True,
-    )
-    first = pipeline.run_publisher("fake")
-    # PerEpisodeRightsCrawler yields two episodes — one admitted
-    # via the cc_by override, one rejected by the paywalled
-    # publisher-level code. Both must land in the in-memory skip
-    # set so a re-invocation doesn't re-fetch either.
-    assert first.episodes_admitted == 1
-    assert first.episodes_rejected_rights == 1
-    assert first.episodes_skipped_incremental == 0
-    assert pipeline._known_ids_by_publisher["fake"] == {
-        "fake_flagship_allowed",
-        "fake_flagship_rejected",
-    }
-
-    # Reset the registry so subsequent tests use the vanilla
-    # ``FakeCrawler``.
-    crawlers._REGISTRY.pop("fake", None)
+    try:
+        pipeline = Pipeline(
+            configs={"fake": _config("paywalled")},  # publisher-level: blocked
+            packs_root=tmp_path,
+            incremental=True,
+        )
+        first = pipeline.run_publisher("fake")
+        # PerEpisodeRightsCrawler yields two episodes — one admitted
+        # via the cc_by override, one rejected by the paywalled
+        # publisher-level code. Both must land in the in-memory skip
+        # set so a re-invocation doesn't re-fetch either.
+        assert first.episodes_admitted == 1
+        assert first.episodes_rejected_rights == 1
+        assert first.episodes_skipped_incremental == 0
+        assert pipeline._known_ids_by_publisher["fake"] == {
+            "fake_flagship_allowed",
+            "fake_flagship_rejected",
+        }
+    finally:
+        # Reset the registry so subsequent tests use the vanilla
+        # ``FakeCrawler``. Guarded by ``try/finally`` so an assertion
+        # failure above doesn't leak ``PerEpisodeRightsCrawler``
+        # into later tests (round-9 ANALYSIS_0001).
+        crawlers._REGISTRY.pop("fake", None)
 
 
 def test_pipeline_in_memory_skip_set_updates_after_dedup(

@@ -356,8 +356,21 @@ class Pipeline:
         rows, so a re-admission of a previously-deprecated
         episode is never silently absorbed by dedup.
         """
-        # frozenset() on every call would defeat the in-process
-        # update path; we hand out a frozen view of the live set.
+        # Snapshot semantics: we return ``frozenset`` of the
+        # publisher's current skip set so the caller (typically
+        # ``BaseCrawler.incremental_sync`` via ``_iter_episodes``)
+        # makes its slug-level skip decisions against a stable
+        # value for the duration of the current ``run_publisher``.
+        # The in-process updates at the three terminal sites
+        # (admitted, rejected, deduped) mutate
+        # ``_known_ids_by_publisher`` directly and therefore do
+        # NOT retroactively affect the *current* publisher's
+        # run — they only take effect on a *subsequent*
+        # ``run_publisher`` call for the same publisher (the
+        # duplicate-target scenario). This is by design: re-
+        # snapshotting per-slug would also defeat the
+        # iter-as-list contract that ``_iter_episodes`` depends
+        # on for deterministic tracebacks.
         return frozenset(self._known_ids_by_publisher.get(publisher_id, ()))
 
     def _rights_gate_allows(self, rights_code: str) -> bool:
