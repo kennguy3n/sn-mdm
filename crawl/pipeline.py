@@ -210,6 +210,24 @@ class Pipeline:
                     self._write_governance(
                         gov_fp, crawler, normalised, deprecated=True
                     )
+                    # Mirror of the boot-time deprecated-row
+                    # treatment in ``_load_governance_state``: the
+                    # episode was just rejected under the *current*
+                    # allowlist, so its episode_id MUST land in the
+                    # in-memory skip set. Without this, a second
+                    # ``run_publisher(publisher_id)`` call within
+                    # the same :class:`Pipeline` lifetime (duplicate
+                    # entry in the ``targets`` list) would re-fetch
+                    # the same persistently-rejected episode, run
+                    # the gate again, and append another deprecated
+                    # governance row — defeating the round-5 fix at
+                    # the in-process boundary. The boot-time and
+                    # in-process invariants must agree: a rejection
+                    # under the active policy is sticky for the
+                    # remainder of the run.
+                    self._known_ids_by_publisher.setdefault(
+                        publisher_id, set()
+                    ).add(crawler.episode_id_for_slug(raw.episode_slug))
                     continue
 
                 # Normalise *first* so the content-hash is available
@@ -281,22 +299,41 @@ class Pipeline:
         return episodes
 
     def _known_ids_for(self, publisher_id: str) -> frozenset[str]:
-        """Return the set of ``episode_id``s previously admitted
-        for ``publisher_id``.
+        """Return the set of ``episode_id``s the incremental gate
+        should skip for ``publisher_id``.
 
         The underlying ``_known_ids_by_publisher`` map is populated
         once at construction time (single pass over the governance
         log alongside ``_seen_content_hashes``) and *kept in sync*
-        as the current run admits new episodes — see
-        :meth:`run_publisher`, which adds each freshly-admitted
-        episode_id to the publisher's set. This means a second
-        ``run_publisher`` call for the same publisher inside one
-        :class:`Pipeline` lifetime (e.g. duplicate entry in the
+        as the current run admits OR rejects new episodes — see
+        :meth:`run_publisher`, which adds the episode_id in both
+        the admitted and the rights-rejected paths. This means a
+        second ``run_publisher`` call for the same publisher inside
+        one :class:`Pipeline` lifetime (e.g. duplicate entry in the
         ``targets`` list) correctly attributes the skip to the
-        incremental counter, not the content-hash dedup counter.
-        Only non-deprecated rows count — a rights-rejected episode
-        is *not* in the skip set because a future crawl could
-        legitimately re-admit it under a different rights code.
+        incremental counter, not the content-hash dedup counter,
+        whether the first call admitted or rejected the episode.
+
+        Skip-set composition rules (cross-reference
+        :meth:`_load_governance_state` for the boot-time source
+        of truth):
+
+        * Non-deprecated rows: always included (the episode is in
+          the pack).
+        * Deprecated rows whose ``rights_code`` is *still* outside
+          the current ``rights_allowlist``: included. The episode
+          was rejected by an active policy, so re-fetching it
+          would only re-reject and append another deprecated row.
+        * Deprecated rows whose ``rights_code`` is now in the
+          current ``rights_allowlist``: NOT included. The
+          allowlist has changed since the rejection, and the
+          incremental gate must let the crawler re-fetch so the
+          rights gate can re-admit under the new policy.
+
+        The content-hash dedup gate has its own (publisher-
+        agnostic) skip set populated only from non-deprecated
+        rows, so a re-admission of a previously-deprecated
+        episode is never silently absorbed by dedup.
         """
         # frozenset() on every call would defeat the in-process
         # update path; we hand out a frozen view of the live set.

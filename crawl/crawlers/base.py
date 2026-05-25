@@ -936,12 +936,21 @@ class BaseCrawler:
         ``episode_id`` is not already present in
         ``known_episode_ids``.
 
-        ``known_episode_ids`` is the set of episode_ids previously
-        admitted for this publisher, typically derived from the
-        governance log by :class:`crawl.pipeline.Pipeline` (only
-        rows with ``deprecated = false`` count — a rights-rejected
-        episode could be re-admitted under a different rights code
-        on a future crawl, so the cursor must not freeze rejections).
+        ``known_episode_ids`` is the set of episode_ids the
+        pipeline has decided we should NOT re-fetch on this run.
+        The crawler treats the set as opaque — the policy that
+        produced it lives in :class:`crawl.pipeline.Pipeline`
+        (see :meth:`crawl.pipeline.Pipeline._load_governance_state`
+        and :meth:`crawl.pipeline.Pipeline._known_ids_for` for the
+        composition rules). Concretely, the set contains every
+        episode currently in the pack (so re-fetching would just
+        round-trip the same content) AND every previously-rejected
+        episode whose ``rights_code`` is still outside the active
+        rights allowlist (so re-fetching would just re-reject and
+        append another deprecated governance row). It does *not*
+        contain previously-rejected episodes whose ``rights_code``
+        is now in the allowlist — those need to be re-fetched so
+        the rights gate can re-admit under the new policy.
 
         Passing ``None`` or an empty set falls back to a full
         :meth:`initial_sync` walk so a fresh ``packs/`` tree or a

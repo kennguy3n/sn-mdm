@@ -1049,6 +1049,51 @@ def test_pipeline_in_memory_skip_set_updates_after_admission(
     }
 
 
+def test_pipeline_in_memory_skip_set_updates_after_rights_rejection(
+    tmp_path: Path,
+) -> None:
+    """Regression for round-6 ANALYSIS_0002: episodes *rejected* by
+    the rights gate during the current ``run_publisher`` call must
+    also land in ``_known_ids_by_publisher`` so a second invocation
+    for the same publisher in the same :class:`Pipeline` lifetime
+    correctly attributes the skip to the incremental counter and
+    does not re-fetch, re-reject, and append a duplicate deprecated
+    governance row.
+
+    The boot-time policy is: a deprecated entry is in the skip set
+    IFF its ``rights_code`` is still outside the current
+    ``rights_allowlist``. A rejection that *just happened* during
+    this run was by definition processed under the current
+    allowlist, so the rejection is necessarily sticky for the
+    remainder of the process — there's no need to re-evaluate the
+    ``still_rejected`` predicate at the in-process update site.
+    """
+    from crawl import crawlers
+
+    crawlers._REGISTRY["fake"] = PerEpisodeRightsCrawler  # type: ignore[attr-defined]
+    pipeline = Pipeline(
+        configs={"fake": _config("paywalled")},  # publisher-level: blocked
+        packs_root=tmp_path,
+        incremental=True,
+    )
+    first = pipeline.run_publisher("fake")
+    # PerEpisodeRightsCrawler yields two episodes — one admitted
+    # via the cc_by override, one rejected by the paywalled
+    # publisher-level code. Both must land in the in-memory skip
+    # set so a re-invocation doesn't re-fetch either.
+    assert first.episodes_admitted == 1
+    assert first.episodes_rejected_rights == 1
+    assert first.episodes_skipped_incremental == 0
+    assert pipeline._known_ids_by_publisher["fake"] == {
+        "fake_flagship_allowed",
+        "fake_flagship_rejected",
+    }
+
+    # Reset the registry so subsequent tests use the vanilla
+    # ``FakeCrawler``.
+    crawlers._REGISTRY.pop("fake", None)
+
+
 def test_incremental_sync_log_line_uses_incremental_prefix(
     tmp_path: Path, caplog
 ) -> None:
