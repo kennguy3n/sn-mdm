@@ -29,7 +29,7 @@
   "scripts": {
     "build": "napi build --platform --release --js index.js --dts index.d.ts",
     "build:debug": "napi build --platform --js index.js --dts index.d.ts",
-    "test": "node --test 'test/*.test.mjs'"
+    "test": "node --test test/smoke.test.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.6.2"

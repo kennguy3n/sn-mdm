@@ -43,7 +43,8 @@
 use napi::bindgen_prelude::{BigInt, Error as JsError, Result};
 use napi_derive::napi;
 
-use crate::{NapiError, NapiResult, PackHandle, QueryRequest};
+use crate::types::JsSearchHit;
+use crate::{JsQueryRequest, NapiError, NapiResult, PackHandle};
 
 /// Convert a [`NapiError`] into a structured [`napi::Error`].
 ///
@@ -145,18 +146,20 @@ pub fn open_pack(path: String) -> Result<BigInt> {
 #[napi(js_name = "search")]
 pub fn search(handle: BigInt, request: serde_json::Value) -> Result<serde_json::Value> {
     let handle = handle_from_bigint(&handle)?;
-    let typed: QueryRequest = serde_json::from_value(request).map_err(|err| {
+    let typed: JsQueryRequest = serde_json::from_value(request).map_err(|err| {
         to_js_error(NapiError::InvalidArgument {
             message: format!("could not parse query request: {err}"),
         })
     })?;
     let hits = forward(crate::search(handle, typed))?;
-    // ``SearchHit`` is plain ``Serialize`` with no failure paths
-    // by construction. ``serde_json::to_value`` only fails on
-    // malformed key types — ``SearchHit`` has none — so a runtime
-    // error here would surface as ``Internal`` per the envelope
-    // contract.
-    serde_json::to_value(&hits).map_err(|err| {
+    // Convert each ``pack_core::SearchHit`` into its camelCase
+    // JS-facing twin before serialising. Keeping the conversion
+    // explicit (rather than slapping ``rename_all`` on
+    // ``SearchHit``) means the on-disk JSONL contract consumed by
+    // the Python pipeline and the ``pack-search`` CLI stays
+    // untouched while JS callers see idiomatic camelCase keys.
+    let js_hits: Vec<JsSearchHit> = hits.into_iter().map(JsSearchHit::from).collect();
+    serde_json::to_value(&js_hits).map_err(|err| {
         to_js_error(NapiError::Internal {
             message: format!("could not encode hits: {err}"),
         })

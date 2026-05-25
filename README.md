@@ -161,14 +161,33 @@ const handle = openPack('packs/sn-mdm-tranche1.pack');
 try {
   const hits = search(handle, {
     text: 'venture capital network effects',
-    tags: { industry: ['retail', 'fintech'] },
+    tags: {
+      industry: ['retail', 'fintech'],
+      businessModel: ['B2B'],
+      evidenceType: ['podcast_transcript_html'],
+    },
     limit: 5,
+    scope: 'local-only',         // or 'include-embeddings'
+    // queryEmbedding: [...],     // required when scope = 'include-embeddings'
+    // semanticModelTag: 'miniLM-v1',
   });
-  console.log(hits);
+  for (const h of hits) {
+    console.log(h.chunkId, h.rankScore, h.citationAnchor);
+  }
 } finally {
   closePack(handle);
 }
 ```
+
+The JS surface is camelCase throughout — request keys
+(`businessModel`, `evidenceType`, `queryEmbedding`,
+`semanticModelTag`), enum values (kebab-case `local-only` /
+`include-embeddings`), and response fields (`chunkId`,
+`episodeId`, `rankScore`, `tagMatch`, `createdAt`, …).
+Unknown / snake_case keys are dropped silently by the
+deserialiser, so a typo like `business_model` will not
+filter the result set.
+
 
 `openPack` returns a `BigInt` handle the caller must pass back
 to `search` and `closePack`. Errors are raised as JS `Error`
@@ -184,7 +203,7 @@ Build the addon:
 cd crates/napi
 npm install
 npm run build      # release; produces pack.<target>.node
-npm test           # node --test 'test/*.test.mjs'
+npm test           # node --test test/
 ```
 
 ## Testing

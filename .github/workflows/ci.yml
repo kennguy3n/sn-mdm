@@ -110,10 +110,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # Share the cache key with the main ``rust`` job's
-          # stable Linux build so each leg warms the other.
-          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          # Use a job-specific key. The ``napi-build`` job builds
+          # a ``cdylib`` target (different artefact set, different
+          # linker flags via ``napi-build``'s build.rs) than the
+          # main ``rust`` job's plain ``cargo test``; a shared key
+          # would have one job constantly invalidating the other's
+          # ``target/`` contents. ``restore-keys`` still lets the
+          # registry / git index warm-start from any sibling job's
+          # cache, so dependency downloads stay deduped without
+          # forcing repeated full rebuilds of the napi cdylib.
+          key: ${{ runner.os }}-cargo-napi-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-napi-
             ${{ runner.os }}-cargo-stable-
 
       - name: cargo test -p pack_napi --lib
@@ -129,7 +137,14 @@ jobs:
 
       - name: node smoke tests
         working-directory: crates/napi
-        run: node --test 'test/*.test.mjs'
+        # ``node --test test/`` walks the directory and runs every
+        # file matching the standard test-file pattern. Avoid
+        # passing a quoted glob (``'test/*.test.mjs'``) because
+        # Node 20's ``--test`` does NOT expand globs internally
+        # (that's a Node 22+ feature) and bash leaves the quoted
+        # string literal, so Node fails with
+        # ``Could not find 'test/*.test.mjs'``.
+        run: npm test
 
   python:
     name: python (ruff / pytest)

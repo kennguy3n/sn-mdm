@@ -44,7 +44,7 @@ pub mod error;
 pub mod types;
 
 pub use error::{NapiError, NapiResult};
-pub use types::QueryRequest;
+pub use types::{JsQueryRequest, JsSearchHit, JsSearchScope, JsTagFilter, QueryRequest};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -72,14 +72,23 @@ pub const NONE_HANDLE: PackHandle = 0;
 /// alongside the store so dropping the registry entry on
 /// [`close_pack`] also cleans up the extracted SQLite file on
 /// disk.
+///
+/// **Field order matters** — Rust drops struct fields in
+/// declaration order, and we need ``store`` (which owns a
+/// [`rusqlite::Connection`] holding an open file handle on the
+/// SQLite file) to drop *before* ``_tempdir`` (which removes the
+/// directory containing that file). On Windows, ``remove_dir_all``
+/// would otherwise fail because the file is still locked by the
+/// open connection, and ``TempDir::drop`` swallows the error,
+/// leaking the temp directory silently.
 struct OpenPack {
+    store: Mutex<PackStore>,
     /// Hold the [`TempDir`] for the lifetime of the entry — when
     /// the registry drops the [`Arc<OpenPack>`], the tempdir is
-    /// removed along with the extracted SQLite file. Marking with
+    /// removed along with the extracted SQLite file. Marked with
     /// an underscore-prefixed name because we never read the field
     /// after construction; the RAII drop is the whole point.
     _tempdir: TempDir,
-    store: Mutex<PackStore>,
 }
 
 // ``PackStore`` wraps a ``rusqlite::Connection`` which is ``Send``
@@ -167,8 +176,8 @@ pub fn open_pack(path: &str) -> NapiResult<PackHandle> {
 
     let handle = next_handle();
     let entry = Arc::new(OpenPack {
-        _tempdir: dir,
         store: Mutex::new(store),
+        _tempdir: dir,
     });
     write_registry().insert(handle, entry);
     Ok(handle)
@@ -190,7 +199,7 @@ pub fn open_pack(path: &str) -> NapiResult<PackHandle> {
 /// * [`NapiError::Pack`] forwarding any [`pack_core::PackError`]
 ///   from the underlying search engine (SQL prepare/exec, JSON
 ///   tag-decode, embedding-shape mismatch, ...).
-pub fn search(handle: PackHandle, request: QueryRequest) -> NapiResult<Vec<SearchHit>> {
+pub fn search(handle: PackHandle, request: JsQueryRequest) -> NapiResult<Vec<SearchHit>> {
     if handle == NONE_HANDLE {
         return Err(NapiError::InvalidArgument {
             message: "handle is the reserved 0 sentinel, never returned by open_pack".into(),
@@ -206,11 +215,11 @@ pub fn search(handle: PackHandle, request: QueryRequest) -> NapiResult<Vec<Searc
 
     let query = SearchQuery {
         text: request.text,
-        tags: request.tags,
+        tags: request.tags.into(),
         query_embedding: request.query_embedding,
         semantic_model_tag: request.semantic_model_tag,
         limit: request.limit,
-        scope: request.scope,
+        scope: request.scope.into(),
         weights: None,
     };
 

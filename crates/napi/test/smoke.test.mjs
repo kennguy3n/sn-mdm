@@ -199,11 +199,19 @@ test('open → search → close round-trips against a real .pack', () => {
     assert.ok(Array.isArray(hits));
     assert.equal(hits.length, 1);
     const hit = hits[0];
-    assert.equal(hit.chunk_id, 'smoketest_flagship_widgets#0001');
-    assert.equal(hit.episode_id, 'smoketest_flagship_widgets');
-    assert.ok(typeof hit.rank_score === 'number');
+    // Response keys are camelCase to match the JS surface.
+    assert.equal(hit.chunkId, 'smoketest_flagship_widgets#0001');
+    assert.equal(hit.episodeId, 'smoketest_flagship_widgets');
+    assert.ok(typeof hit.rankScore === 'number');
     // BM25 should fire because the text query matches.
-    assert.ok(hit.bm25_score !== null && hit.bm25_score !== undefined);
+    assert.ok(hit.bm25Score !== null && hit.bm25Score !== undefined);
+    assert.equal(hit.tagMatch, false);
+    assert.ok(typeof hit.createdAt === 'number');
+    assert.equal(hit.citationAnchor, 'https://example.com/ep/1#section-1');
+    assert.equal(hit.sectionHeading, 'Manufacturing');
+    // Verify no snake_case sneak-through.
+    assert.equal(hit.chunk_id, undefined);
+    assert.equal(hit.rank_score, undefined);
 
     const closed = core.closePack(handle);
     assert.equal(closed, true);
@@ -235,9 +243,9 @@ test('tag-only search returns the chunk via structured match', () => {
       limit: 5,
     });
     assert.equal(hits.length, 1);
-    assert.equal(hits[0].chunk_id, 'smoketest_flagship_widgets#0001');
-    // Tag-only queries always set ``tag_match = true``.
-    assert.equal(hits[0].tag_match, true);
+    assert.equal(hits[0].chunkId, 'smoketest_flagship_widgets#0001');
+    // Tag-only queries always set ``tagMatch = true``.
+    assert.equal(hits[0].tagMatch, true);
     core.closePack(handle);
   } finally {
     cleanup(workdir);
@@ -268,6 +276,121 @@ test('multiple open packs have distinct handles', () => {
   } finally {
     cleanup(a.workdir);
     cleanup(b.workdir);
+  }
+});
+
+test('camelCase businessModel and evidenceType filters are honored', () => {
+  // Regression for the silent-loss bug: the JS surface accepts
+  // ``businessModel`` / ``evidenceType`` (camelCase, matching the
+  // rest of the request body). Sending those keys must filter the
+  // result set, not silently fall through to defaults.
+  const { workdir, packPath } = buildTestPack();
+  try {
+    const handle = core.openPack(packPath);
+
+    // Hit on businessModel — the fixture is tagged ``B2B``.
+    let hits = core.search(handle, {
+      text: '',
+      tags: { businessModel: ['B2B'] },
+      limit: 5,
+    });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].chunkId, 'smoketest_flagship_widgets#0001');
+
+    // Miss on businessModel — a tag the fixture does not carry.
+    hits = core.search(handle, {
+      text: '',
+      tags: { businessModel: ['nonprofit'] },
+      limit: 5,
+    });
+    assert.deepEqual(hits, []);
+
+    // Hit on evidenceType — fixture's ``source_type`` is
+    // ``podcast_transcript_html``.
+    hits = core.search(handle, {
+      text: '',
+      tags: { evidenceType: ['podcast_transcript_html'] },
+      limit: 5,
+    });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].chunkId, 'smoketest_flagship_widgets#0001');
+
+    // Miss on evidenceType.
+    hits = core.search(handle, {
+      text: '',
+      tags: { evidenceType: ['whitepaper'] },
+      limit: 5,
+    });
+    assert.deepEqual(hits, []);
+
+    core.closePack(handle);
+  } finally {
+    cleanup(workdir);
+  }
+});
+
+test('snake_case businessModel key on the JS surface is treated as unknown', () => {
+  // Defense in depth: if a caller mistakenly sends ``business_model``
+  // (snake_case), the camelCase-only typed deserialiser must
+  // either ignore the unknown key or raise. Either way, the
+  // documented camelCase contract is preserved — there's no
+  // silent fallback that admits the snake_case spelling.
+  const { workdir, packPath } = buildTestPack();
+  try {
+    const handle = core.openPack(packPath);
+    const hits = core.search(handle, {
+      text: '',
+      tags: { business_model: ['B2B'] },
+      limit: 5,
+    });
+    // ``business_model`` (snake_case) is unknown to JsTagFilter,
+    // so the filter collapses to all-empty, which means no lane
+    // is active (no text, no active tags, no embedding). The
+    // search correctly returns 0 hits. If the snake_case key
+    // WERE honoured, ``businessModel: ['B2B']`` would activate
+    // the tag-only lane and match the fixture's episode, yielding
+    // 1 hit. Asserting 0 proves the snake_case key was dropped.
+    assert.deepEqual(hits, []);
+    core.closePack(handle);
+  } finally {
+    cleanup(workdir);
+  }
+});
+
+test('local-only scope accepted (kebab-case)', () => {
+  const { workdir, packPath } = buildTestPack();
+  try {
+    const handle = core.openPack(packPath);
+    const hits = core.search(handle, {
+      text: 'widgets',
+      scope: 'local-only',
+      limit: 5,
+    });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].chunkId, 'smoketest_flagship_widgets#0001');
+    core.closePack(handle);
+  } finally {
+    cleanup(workdir);
+  }
+});
+
+test('unknown scope spelling raises InvalidArgument', () => {
+  const { workdir, packPath } = buildTestPack();
+  try {
+    const handle = core.openPack(packPath);
+    try {
+      // ``LocalOnly`` (PascalCase) is NOT the wire format —
+      // the JS surface expects kebab-case (``local-only``).
+      core.search(handle, { text: 'widgets', scope: 'LocalOnly' });
+      assert.fail('expected PascalCase scope to throw');
+    } catch (err) {
+      const parsed = JSON.parse(err.message);
+      assert.equal(parsed.kind, 'InvalidArgument');
+    } finally {
+      core.closePack(handle);
+    }
+  } finally {
+    cleanup(workdir);
   }
 });
 
