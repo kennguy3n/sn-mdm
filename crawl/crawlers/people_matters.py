@@ -19,13 +19,21 @@ from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 LOG = logging.getLogger(__name__)
 
 _PODCAST_SITEMAP_URL = "https://www.peoplematters.in/sitemap.xml/podcast"
-# Slugs may contain ``/`` (season-prefixed paths like
-# ``the-art-of-the-possible/ep-14-the-art-of-the-possible``) or
-# even ``:`` (a literal in the season-1 hub URL). The character
-# class allows both.
+# Real episode permalinks under ``/podcast/`` are namespaced under
+# a series — they always look like ``<series>/<ep-slug>`` (with
+# at least one ``/`` separating the season/series from the
+# per-episode slug). Standalone slugs like
+# ``season-1:-the-art-of-the-possible`` are series *hub* pages
+# and carry the site-wide title ("People Matters – Latest HR
+# Trends, News & Articles") rather than transcript content; we
+# reject them here so they don't pollute the metadata stream.
+# The look-ahead enforces the embedded ``/`` while the main
+# capture preserves the full multi-segment slug for
+# ``_episode_url``.
 _PODCAST_LOC_RE = re.compile(
     r"<loc>\s*https?://(?:www\.)?peoplematters\.in/podcast/"
-    r"([a-z0-9][a-z0-9\-/:]*?)/?\s*</loc>"
+    r"(?=[a-z0-9][a-z0-9\-:]*/[a-z0-9])"
+    r"([a-z0-9][a-z0-9\-/:]*?[a-z0-9])/?\s*</loc>"
 )
 
 

@@ -34,6 +34,11 @@ _SITEMAP_URLS = (
 )
 _EPISODE_LOC_RE = re.compile(
     r"<loc>\s*https?://(?:www\.)?bcg\.com/featured-insights/podcasts/"
+    # Same defence-in-depth pagination filter we apply to other
+    # WordPress-shaped sources (IMD): reject ``…/podcasts/page/N``
+    # URLs even though BCG's Google sitemap doesn't currently
+    # include pagination entries. Cheap to keep, costly to forget.
+    r"(?!page/)"
     r"([a-z0-9\-]+/[a-z0-9\-]+)/?\s*</loc>"
 )
 

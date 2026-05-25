@@ -697,7 +697,15 @@ class BaseCrawler:
         """
         seen: set[str] = set()
         slugs: list[str] = []
-        for source in (self.config.episodes, self._discover_episode_slugs()):
+        # Compute the *unique* seed count first so the discovered
+        # count we log is the true count of slugs that came in via
+        # ``_discover_episode_slugs`` and not just the difference
+        # between the total and the (possibly duplicate-bloated)
+        # raw seed length. Without this, configs with duplicate
+        # entries in ``episodes`` would silently undercount the
+        # discovery side.
+        seed_slugs = list(dict.fromkeys(self.config.episodes))
+        for source in (seed_slugs, self._discover_episode_slugs()):
             for slug in source:
                 if slug in seen:
                     continue
@@ -707,8 +715,8 @@ class BaseCrawler:
         LOG.info(
             "%s: initial_sync — %d seed + %d discovered → %d unique slugs",
             self.publisher_id,
-            len(self.config.episodes),
-            max(0, len(slugs) - len(self.config.episodes)),
+            len(seed_slugs),
+            max(0, len(slugs) - len(seed_slugs)),
             len(slugs),
         )
 

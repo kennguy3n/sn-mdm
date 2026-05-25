@@ -91,12 +91,13 @@ fn run(args: &Args) -> Result<(), BuildError> {
             .filter_map(|e| e.ok())
             .any(|e| e.path().extension().is_some_and(|x| x == "jsonl"));
     if !any_metadata {
-        return Err(BuildError::NoMetadata {
-            path: metadata_dir,
-        });
+        return Err(BuildError::NoMetadata { path: metadata_dir });
     }
 
-    eprintln!("pack-build: ingesting JSONL trees under {}", args.packs_root.display());
+    eprintln!(
+        "pack-build: ingesting JSONL trees under {}",
+        args.packs_root.display()
+    );
     let store = PackStore::open_in_memory()?;
     let report = store.ingest_jsonl_files(&args.packs_root)?;
     let totals = report.totals();

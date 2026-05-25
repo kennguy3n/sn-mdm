@@ -25,8 +25,18 @@ from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 LOG = logging.getLogger(__name__)
 
 _INDEX_URL = "https://www.imd.org/ibyimd/category/podcasts/"
+# The slug capture allows ``/`` so that nested series prefixes
+# such as ``leaders-unplugged/<episode>`` are preserved verbatim,
+# but the negative lookahead rejects WordPress pagination links
+# (``/podcasts/page/2``, ``/podcasts/page/3``, …) which would
+# otherwise be ingested as if they were episode pages. The
+# trailing ``[a-z0-9]`` anchor on the capture forces at least one
+# non-slash terminal segment so we don't accept directory-style
+# slugs like ``leaders-unplugged/`` either.
 _HREF_RE = re.compile(
-    r"^https?://(?:www\.)?imd\.org/ibyimd/podcasts/([a-z0-9][a-z0-9\-/]*?)/?$"
+    r"^https?://(?:www\.)?imd\.org/ibyimd/podcasts/"
+    r"(?!page/)"
+    r"([a-z0-9][a-z0-9\-/]*[a-z0-9])/?$"
 )
 
 

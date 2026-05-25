@@ -47,7 +47,7 @@ Every episode is tagged across the 5 families
 | Masters of Scale                       | `masters_of_scale.py`         | `mastersofscale.com/episode/{slug}` HTML transcripts                 | `free_access_copyrighted` | US / global       |
 | People Matters                         | `people_matters.py`           | `peoplematters.in/podcast/{slug}`                                    | `free_access_copyrighted` | India / SEA       |
 | RBC Disruptors                         | `rbc_disruptors.py`           | `rbc.com/en/thought-leadership/disruptors/{slug}`                    | `free_access_copyrighted` | Canada            |
-| IMD Business School                    | `imd.py`                      | `imd.org/ibyimd/category/podcasts/{slug}`                            | `free_access_copyrighted` | Switzerland       |
+| IMD Business School                    | `imd.py`                      | `imd.org/ibyimd/podcasts/{slug}`                                     | `free_access_copyrighted` | Switzerland       |
 | WEF Radio Davos                        | `wef_radio_davos.py`          | `weforum.org/podcasts/radio-davos/episodes/{slug}`                   | `cc_by_nc_nd`             | global            |
 | Deutsche Bank                          | `deutsche_bank.py`            | `corporates.db.com/multimedia/{slug}` + `db.com/news/detail/{slug}`  | `free_access_copyrighted` | Germany / APAC    |
 | UK NCSC Toolkit for Boards             | `ncsc.py`                     | `ncsc.gov.uk/information/toolkit-for-boards-audio-transcripts`       | `ogl_v3`                  | UK                |
@@ -78,11 +78,11 @@ each source.
 | `bcg`              | `google_sitemap-content`   | working — 15 episode permalinks (Imagine This series).                                             |
 | `exit_five`        | `/podcast` HTML index      | working — 12 episode slugs per run.                                                                |
 | `frog`             | `/designmind` HTML index   | working — 4 frogcast permalinks.                                                                   |
-| `imd`              | `/ibyimd/category/podcasts/` HTML | working — 24 episode permalinks across series.                                              |
+| `imd`              | `/ibyimd/category/podcasts/` HTML | working — 22 episode permalinks across series; WordPress `/page/N` pagination rejected at discovery.                                              |
 | `masters_of_scale` | `episode-sitemap.xml`      | working — first 25 of 700+ permalinks (WordPress sitemap).                                         |
 | `microsoft_cyber`  | `post-sitemap{1,2}.xml`    | working — 25 episode permalinks (`Public Sector Future` + `Future of Infrastructure`). One per-run skip when `traffic.libsyn.com` `robots.txt` disallows a transcript PDF — expected behaviour.           |
 | `ncsc`             | (single-page, seeded)      | working — 1 verbatim CISO-board transcript page, OGL-v3.                                           |
-| `people_matters`   | `sitemap.xml/podcast`      | working — 25 of 61 podcast permalinks.                                                             |
+| `people_matters`   | `sitemap.xml/podcast`      | working — 25 of 61 podcast permalinks (series *hub* pages — slugs without an embedded `/<ep-slug>` — are rejected; only true `<series>/<episode>` permalinks are admitted).                                                             |
 | `deutsche_bank`    | n/a                        | **Gap** — `corporates.db.com` is a Drupal CMS that renders the episode list client-side and ships no per-show sitemap. Needs a headless-browser walker (out of scope for this PR). |
 | `mckinsey`         | n/a                        | **Gap** — `www.mckinsey.com` times out on every plain HTTPS GET from this VM (likely a WAF rule). Needs either a different egress IP or a headless-browser walker. |
 | `rbc_disruptors`   | n/a                        | **Gap** — `thoughtleadership.rbc.com/rbc-disruptors-archives/` redirects to `www.rbc.com/en/thought-leadership/disruptors/` which is fully client-rendered. No sitemap subset for podcasts. |
