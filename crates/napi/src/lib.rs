@@ -118,16 +118,27 @@ fn read_registry() -> RwLockReadGuard<'static, HashMap<PackHandle, Arc<OpenPack>
     // process is strictly worse than continuing on a possibly
     // racy snapshot, and the only mutation we make on the write
     // side is an ``insert`` / ``remove`` which never leaves the
-    // map in a half-baked state.
-    registry()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    // map in a half-baked state. The recovery is logged to stderr
+    // so a Node host wiring ``process.stderr`` to its own telemetry
+    // can surface the panic that produced the poison, rather than
+    // it being silently swallowed.
+    registry().read().unwrap_or_else(|poisoned| {
+        eprintln!(
+            "pack_napi: recovered from poisoned registry RwLock (read); \
+             a prior write-holder panicked. Continuing with the recovered map."
+        );
+        poisoned.into_inner()
+    })
 }
 
 fn write_registry() -> RwLockWriteGuard<'static, HashMap<PackHandle, Arc<OpenPack>>> {
-    registry()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    registry().write().unwrap_or_else(|poisoned| {
+        eprintln!(
+            "pack_napi: recovered from poisoned registry RwLock (write); \
+             a prior write-holder panicked. Continuing with the recovered map."
+        );
+        poisoned.into_inner()
+    })
 }
 
 /// Allocate the next handle. Monotonic — never re-mints a value,
@@ -229,10 +240,14 @@ pub fn search(handle: PackHandle, request: JsQueryRequest) -> NapiResult<Vec<Sea
     // an autocommit handle so a panic between statements doesn't
     // leave a transaction open — so we recover from the poison
     // and re-run rather than failing the entire pack handle.
-    let store = entry
-        .store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = entry.store.lock().unwrap_or_else(|poisoned| {
+        eprintln!(
+            "pack_napi: recovered from poisoned per-pack Mutex on handle {handle}; \
+             a prior search panicked mid-query. The SQLite connection is autocommit, \
+             so the recovered handle is safe to reuse."
+        );
+        poisoned.into_inner()
+    });
     let engine = SearchEngine::new(&store);
     let hits = engine.search(&query)?;
     Ok(hits)
@@ -377,11 +392,15 @@ mod tests {
 
     #[test]
     fn close_unknown_handle_is_noop() {
-        // ``999_999`` was never returned by ``next_handle`` in this
-        // test process (the counter starts at 1 and only the
-        // ``round_trip`` test increments it). A double-close on
-        // an already-closed handle should also be a no-op.
-        assert!(!close_pack(999_999));
+        // Use ``u64::MAX`` as the unknown-handle sentinel rather
+        // than a small literal like ``999_999``: ``next_handle``
+        // starts at 1 and increments monotonically, so a future
+        // growth of the test suite could theoretically mint a
+        // collision with any fixed small value. ``u64::MAX`` is
+        // guaranteed to never be reached by ``fetch_add`` in any
+        // practical test process. A double-close on an
+        // already-closed handle (NONE_HANDLE) is also a no-op.
+        assert!(!close_pack(u64::MAX));
         assert!(!close_pack(NONE_HANDLE));
     }
 

@@ -30,8 +30,16 @@ pub type NapiResult<T> = std::result::Result<T, NapiError>;
 /// * [`NapiError::Pack`] — forwarded error from
 ///   [`pack_core::PackError`]. The wrapper preserves the original
 ///   message and stamps its finer-grained ``kind`` on the wire.
+/// ## Wire shape
+///
+/// Serialised via ``#[serde(tag = "variant", content = "data")]`` so
+/// the envelope at the JS boundary has a single ``kind`` field at
+/// the top level (flattened by [`super::bindings::to_js_error`]).
+/// The inner ``variant`` tag is deliberately distinct from
+/// ``kind`` so consumers do not see two fields with the same name
+/// and different meanings when they walk ``detail`` for telemetry.
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "detail")]
+#[serde(tag = "variant", content = "data")]
 pub enum NapiError {
     /// A JS-side argument failed validation.
     #[error("invalid argument: {message}")]
@@ -179,5 +187,19 @@ mod tests {
         let err: NapiError =
             std::io::Error::new(std::io::ErrorKind::NotFound, "missing pack file").into();
         assert_eq!(err.kind(), "Io");
+    }
+
+    #[test]
+    fn serde_inner_tag_is_variant_not_kind() {
+        // The inner serde tag is ``variant`` so the JSON envelope
+        // assembled by ``bindings::to_js_error`` does not have two
+        // ``kind`` fields with different meanings. The top-level
+        // ``kind`` is the finest-grained pack-error tag; this inner
+        // ``variant`` is the NapiError-enum discriminant.
+        let err: NapiError = pack_core::PackError::BadMagic.into();
+        let v: serde_json::Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["variant"], "Pack", "inner tag must be 'variant'");
+        assert_eq!(v["data"]["kind"], "BadMagic");
+        assert!(v.get("kind").is_none(), "inner serde must NOT add 'kind'");
     }
 }

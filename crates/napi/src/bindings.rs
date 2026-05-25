@@ -58,7 +58,13 @@ use crate::{JsQueryRequest, NapiError, NapiResult, PackHandle};
 ///   string suitable for surfacing to the UI.
 /// * ``detail`` is the full serialised [`NapiError`] envelope
 ///   (including the outer ``Pack`` wrapper) for telemetry that
-///   needs the raw structure.
+///   needs the raw structure. The inner enum's serde tag is
+///   ``variant`` (NOT ``kind``) so consumers walking ``detail``
+///   for telemetry don't see two ``kind`` fields with different
+///   meanings — the top-level ``kind`` is the finest-grained
+///   pack-error tag; ``detail.variant`` is the NapiError outer
+///   enum discriminant (``"Pack"`` / ``"InvalidArgument"`` /
+///   ``"Internal"``).
 ///
 /// Callers do:
 ///
@@ -213,7 +219,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(js.reason.as_str()).unwrap();
         assert_eq!(parsed["kind"], "InvalidArgument");
         assert!(parsed["message"].as_str().unwrap().contains("bad handle"));
-        assert_eq!(parsed["detail"]["kind"], "InvalidArgument");
+        // ``detail`` carries the NapiError enum's serde tag under
+        // ``variant`` (deliberately not ``kind``, to avoid a name
+        // collision with the top-level flattened ``kind``).
+        assert_eq!(parsed["detail"]["variant"], "InvalidArgument");
+        assert!(
+            parsed["detail"].get("kind").is_none(),
+            "detail must not have a 'kind' field alongside top-level kind"
+        );
     }
 
     #[test]

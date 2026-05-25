@@ -41,6 +41,17 @@ pub struct JsTagFilter {
     /// Geography-family tag set.
     pub geography: Vec<String>,
     /// Evidence-type-family tag set.
+    ///
+    /// Mirrors the storage shape — the schema column at
+    /// ``crates/pack_core/src/schema.rs`` stores a JSON array, and
+    /// the search engine queries it via ``json_each(...)``. Today
+    /// every ingested episode writes a single-element array
+    /// (``[source_type]``) but the column is intentionally an
+    /// array so a future ingest path can carry both
+    /// ``podcast_transcript_html`` and ``show_notes`` (or
+    /// equivalent) on the same episode without a schema change.
+    /// JS callers send a flat ``string[]`` filter that matches
+    /// against any element via the same ``json_each`` join.
     pub evidence_type: Vec<String>,
 }
 

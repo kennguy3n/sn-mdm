@@ -16,17 +16,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (stable)
-        # ``pack_napi`` depends on napi-rs 3.x which requires
-        # rustc 1.88+, so the workspace's fmt / clippy / test
-        # signal runs on stable. The MSRV (1.85) signal for the
-        # rest of the workspace lives in the ``msrv`` job below
-        # and excludes ``pack_napi`` so the documented MSRV
-        # stays meaningful for ``pack_core`` and the Python
-        # pipeline.
+      - name: Install Rust toolchain (pinned)
+        # Pin to a concrete rustc release rather than tracking the
+        # ``stable`` channel so a future stable bump can't introduce
+        # new clippy lints that break ``-D warnings`` without any
+        # code change. ``napi-rs`` 3.x's effective MSRV is 1.88+,
+        # so the floor of this pin is whatever lets pack_napi build;
+        # bump deliberately when napi-rs / clippy releases warrant
+        # it. The MSRV (1.85) signal for the workspace floor lives
+        # in the ``msrv`` job below and excludes ``pack_napi`` so
+        # the documented MSRV stays meaningful for ``pack_core``
+        # and the Python pipeline.
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.88.0
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -40,9 +43,12 @@ jobs:
           # cache and rebuilds against the new resolved versions.
           # ``restore-keys`` still lets us reuse the registry / git
           # caches across builds, so the cost is only a recompile
-          # of the dependency tree, not a re-download.
-          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          # of the dependency tree, not a re-download. The toolchain
+          # version is part of the cache key so a future rustc bump
+          # cleanly invalidates the previous build artefacts.
+          key: ${{ runner.os }}-cargo-rust-1.88.0-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-rust-1.88.0-
             ${{ runner.os }}-cargo-stable-
 
       - name: cargo fmt --check
@@ -93,10 +99,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (stable)
+      - name: Install Rust toolchain (pinned)
+        # Same pin as the ``rust`` job — see comment there for why
+        # we don't track the unpinned ``stable`` channel.
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -119,10 +127,11 @@ jobs:
           # registry / git index warm-start from any sibling job's
           # cache, so dependency downloads stay deduped without
           # forcing repeated full rebuilds of the napi cdylib.
-          key: ${{ runner.os }}-cargo-napi-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-napi-1.88.0-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-napi-1.88.0-
             ${{ runner.os }}-cargo-napi-
-            ${{ runner.os }}-cargo-stable-
+            ${{ runner.os }}-cargo-rust-1.88.0-
 
       - name: cargo test -p pack_napi --lib
         run: cargo test -p pack_napi --lib
