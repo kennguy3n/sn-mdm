@@ -373,9 +373,31 @@ def main(argv: list[str] | None = None) -> int:
         totals.episodes_skipped_dedup,
         totals.chunks_emitted,
     )
-    # Non-zero exit if every publisher failed to admit anything —
-    # that's almost certainly a crawl regression.
-    if totals.episodes_seen > 0 and totals.episodes_admitted == 0 and totals.episodes_rejected_rights == 0:
+    return exit_code_for(totals)
+
+
+def exit_code_for(totals: PublisherStats) -> int:
+    """Decide the CLI exit code from an aggregate :class:`PublisherStats`.
+
+    Non-zero only when every publisher failed to admit anything *and*
+    the failure can't be explained by either the rights gate or the
+    content-hash dedup short-circuit. The pipeline is documented as
+    idempotent — re-running on a packs root that already contains
+    every episode will (correctly) admit nothing because every
+    episode hashes to a ``content_hash`` that's already in the
+    governance log, and the run should succeed. Likewise a run that
+    only saw rights-rejected episodes is doing exactly what the gate
+    asked of it. Only return non-zero when *all three* explanations
+    are absent — that's the signal of a real crawl regression (e.g.
+    every source's HTML changed shape and parses to empty), not
+    normal steady-state.
+    """
+    if (
+        totals.episodes_seen > 0
+        and totals.episodes_admitted == 0
+        and totals.episodes_rejected_rights == 0
+        and totals.episodes_skipped_dedup == 0
+    ):
         return 1
     return 0
 

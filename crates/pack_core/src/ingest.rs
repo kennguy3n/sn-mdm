@@ -310,11 +310,22 @@ impl PackStore {
                         evidence,
                         now,
                     ])?;
-                // Compute a placeholder content-hash for the episode-level
-                // governance entry. The canonical chunk-level hashes are
-                // written by `ingest_chunk`; this episode-level entry
-                // gives the audit trail one row per ingest cadence.
-                let content_hash = blake3::hash(episode.episode_id.as_bytes());
+                // Hash the *serialised metadata* — not the episode_id
+                // — so the governance row is a useful audit signal.
+                // ``episode_id`` is a stable identifier; hashing it
+                // produces a constant per episode and the resulting
+                // ``governance_log.content_hash`` carries no
+                // information about whether the *captured state of
+                // the episode* changed between ingest passes. By
+                // hashing ``metadata_json`` instead, a re-ingest of
+                // the same episode_id with updated metadata (new
+                // asset URL, fresh ``credibility_notes``, revised
+                // ``rights_summary``, …) produces a *different*
+                // hash, which is the cadence signal the audit trail
+                // is supposed to provide. Canonical chunk-level
+                // hashes are still written separately by
+                // ``ingest_chunk`` over the transcript text.
+                let content_hash = blake3::hash(metadata_json.as_bytes());
                 self.append_governance(&GovernanceEntry {
                     episode_id: episode.episode_id.clone(),
                     rights_code: episode.rights_code.clone(),
@@ -811,6 +822,44 @@ mod tests {
         assert_eq!(
             fts_text, original.chunk_text,
             "FTS5 row must still point at the original text",
+        );
+    }
+
+    #[test]
+    fn governance_content_hash_tracks_metadata_changes() {
+        // Audit invariant: re-ingesting the same episode_id with
+        // updated metadata must produce a *different* governance
+        // ``content_hash`` so the audit trail carries the cadence
+        // signal. The previous behaviour hashed ``episode_id``
+        // alone, which is constant per episode and therefore
+        // useless as a change marker.
+        let store = PackStore::open_in_memory().expect("open");
+        let mut ep = sample_episode("acquired_flagship_costco", "free_access_copyrighted");
+        store.ingest_episode(&ep).unwrap();
+
+        // Mutate metadata in a way that changes ``metadata_json``
+        // (here: revise the summary). The append-only trigger
+        // means the episode row is fixed once written, but the
+        // governance log is allowed to accrue new cadence rows.
+        ep.summary = "Revised summary capturing the new framing".into();
+        store.ingest_episode(&ep).unwrap();
+
+        let hashes: Vec<String> = store
+            .conn
+            .prepare(
+                "SELECT lower(hex(content_hash)) FROM governance_log \
+                 WHERE episode_id = ? AND deprecated = 0 \
+                 ORDER BY id ASC",
+            )
+            .unwrap()
+            .query_map(params![&ep.episode_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(hashes.len(), 2, "two cadence rows: one per ingest pass");
+        assert_ne!(
+            hashes[0], hashes[1],
+            "metadata change must produce a fresh content_hash, not the constant episode_id hash"
         );
     }
 

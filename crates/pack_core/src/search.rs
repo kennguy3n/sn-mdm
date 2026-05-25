@@ -287,57 +287,103 @@ impl<'a> SearchEngine<'a> {
         }
 
         // ---- Semantic lane (optional) ------------------------------
+        //
+        // Cosine similarity is O(N · D) and SQLite has no native
+        // vector index, so the bound on how much work we do here is
+        // structural — push every filter we have *into* the SQL so
+        // the JOIN doesn't materialise rows we'd discard in Rust:
+        //
+        // * Always restrict on ``e.model_tag = ?`` (existing behaviour).
+        // * When a tag filter is active, also restrict on
+        //   ``c.episode_id IN (?, ?, …)`` against the
+        //   already-computed ``matching_episodes`` set. Without
+        //   this, the engine previously pulled every embedding for
+        //   the model tag off disk, decoded it, computed
+        //   similarity, and only *then* discarded the row in Rust
+        //   — wasting I/O linear in the pack size for what's
+        //   usually a tightly scoped tag-and-semantic query. The
+        //   BM25 and tag-only lanes already push their tag filter
+        //   into SQL via the ``HashSet`` membership check; the
+        //   semantic lane is now symmetric.
+        // * Cap with ``LIMIT SEMANTIC_LANE_SCAN_CAP`` as a final
+        //   sanity guard against pathologically large packs. The
+        //   limit is large enough that the cap is effectively never
+        //   the binding constraint at the pack sizes
+        //   ``docs/ARCHITECTURE.md`` targets, but it bounds memory
+        //   for the brute-force scan on any future pack that grows
+        //   beyond the expected envelope. The candidates surfaced
+        //   under the cap still go through the full merge + rank +
+        //   ``query.limit`` truncation downstream, so the cap is
+        //   only ever a *candidate-pool* bound, not a top-K bound.
+        const SEMANTIC_LANE_SCAN_CAP: usize = 5_000;
         if matches!(query.scope, SearchScope::IncludeEmbeddings) {
             if let (Some(qvec), Some(tag)) = (
                 query.query_embedding.as_ref(),
                 query.semantic_model_tag.as_ref(),
             ) {
-                let mut stmt = self.store.connection().prepare(
-                    r#"SELECT e.chunk_id, c.episode_id, c.chunk_text,
-                              c.citation_anchor, c.section_heading,
-                              c.created_at, e.embedding
-                       FROM chunk_embeddings e
-                       JOIN chunk c ON c.chunk_id = e.chunk_id
-                       WHERE e.model_tag = ?"#,
-                )?;
-                let rows = stmt.query_map(params![tag], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, Vec<u8>>(6)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (chunk_id, episode_id, chunk_text, citation, section, created_at, vec_blob) =
-                        row?;
-                    if tags_active && !matching_episodes.contains(&episode_id) {
-                        continue;
+                // Short-circuit: if a tag filter is active and zero
+                // episodes match, the semantic lane is guaranteed
+                // to contribute nothing — skip the full-table scan
+                // entirely.
+                let skip_semantic = tags_active && matching_episodes.is_empty();
+                if !skip_semantic {
+                    let (sql, params_vec) = build_semantic_query(
+                        tag.as_str(),
+                        if tags_active {
+                            Some(&matching_episodes)
+                        } else {
+                            None
+                        },
+                        SEMANTIC_LANE_SCAN_CAP,
+                    );
+                    let mut stmt = self.store.connection().prepare(&sql)?;
+                    let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec
+                        .iter()
+                        .map(|s| s as &dyn rusqlite::ToSql)
+                        .collect();
+                    let rows = stmt.query_map(param_refs.as_slice(), |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, Vec<u8>>(6)?,
+                        ))
+                    })?;
+                    for row in rows {
+                        let (
+                            chunk_id,
+                            episode_id,
+                            chunk_text,
+                            citation,
+                            section,
+                            created_at,
+                            vec_blob,
+                        ) = row?;
+                        let chunk_vec = decode_f32_blob(&vec_blob)?;
+                        if chunk_vec.len() != qvec.len() {
+                            // Mismatched dimension — skip rather than
+                            // silently misrank.
+                            continue;
+                        }
+                        let sim = cosine_similarity(qvec, &chunk_vec);
+                        let entry = merged.entry(chunk_id.clone()).or_insert_with(|| SearchHit {
+                            chunk_id: chunk_id.clone(),
+                            episode_id: episode_id.clone(),
+                            chunk_text,
+                            citation_anchor: citation,
+                            section_heading: section,
+                            rank_score: 0.0,
+                            bm25_score: None,
+                            semantic_score: None,
+                            tag_match: matching_episodes.contains(&episode_id),
+                            created_at,
+                        });
+                        entry.semantic_score = Some(sim);
+                        entry.rank_score += weights.semantic * sim;
                     }
-                    let chunk_vec = decode_f32_blob(&vec_blob)?;
-                    if chunk_vec.len() != qvec.len() {
-                        // Mismatched dimension — skip rather than
-                        // silently misrank.
-                        continue;
-                    }
-                    let sim = cosine_similarity(qvec, &chunk_vec);
-                    let entry = merged.entry(chunk_id.clone()).or_insert_with(|| SearchHit {
-                        chunk_id: chunk_id.clone(),
-                        episode_id: episode_id.clone(),
-                        chunk_text,
-                        citation_anchor: citation,
-                        section_heading: section,
-                        rank_score: 0.0,
-                        bm25_score: None,
-                        semantic_score: None,
-                        tag_match: matching_episodes.contains(&episode_id),
-                        created_at,
-                    });
-                    entry.semantic_score = Some(sim);
-                    entry.rank_score += weights.semantic * sim;
                 }
             }
         }
@@ -446,6 +492,59 @@ impl<'a> SearchEngine<'a> {
         }
         Ok(out)
     }
+}
+
+/// Build the semantic-lane SQL string and its bind-parameter list.
+///
+/// Pulled out of [`SearchEngine::search`] so the SQL is testable in
+/// isolation (no live database needed) and so the two structural
+/// arms — with vs. without an active tag filter — remain trivial to
+/// audit side-by-side. Returns `(sql, params)` where `params` is
+/// the exact ordered list of string parameters to bind: `[tag, ep1,
+/// ep2, …]` when tag-filtering, `[tag]` otherwise.
+fn build_semantic_query(
+    model_tag: &str,
+    matching_episodes: Option<&std::collections::HashSet<String>>,
+    scan_cap: usize,
+) -> (String, Vec<String>) {
+    let mut params: Vec<String> = Vec::with_capacity(1 + matching_episodes.map_or(0, |s| s.len()));
+    params.push(model_tag.to_string());
+    let sql = match matching_episodes {
+        Some(eps) if !eps.is_empty() => {
+            let placeholders = std::iter::repeat_n("?", eps.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            // Push episode ids in sorted order so the bound SQL is
+            // deterministic across runs even though HashSet iteration
+            // is not — useful for query plan caching and for tests
+            // that snapshot the bound parameters.
+            let mut sorted: Vec<&String> = eps.iter().collect();
+            sorted.sort();
+            for ep in sorted {
+                params.push(ep.clone());
+            }
+            format!(
+                r#"SELECT e.chunk_id, c.episode_id, c.chunk_text,
+                          c.citation_anchor, c.section_heading,
+                          c.created_at, e.embedding
+                   FROM chunk_embeddings e
+                   JOIN chunk c ON c.chunk_id = e.chunk_id
+                   WHERE e.model_tag = ?
+                     AND c.episode_id IN ({placeholders})
+                   LIMIT {scan_cap}"#
+            )
+        }
+        _ => format!(
+            r#"SELECT e.chunk_id, c.episode_id, c.chunk_text,
+                      c.citation_anchor, c.section_heading,
+                      c.created_at, e.embedding
+               FROM chunk_embeddings e
+               JOIN chunk c ON c.chunk_id = e.chunk_id
+               WHERE e.model_tag = ?
+               LIMIT {scan_cap}"#
+        ),
+    };
+    (sql, params)
 }
 
 /// Escape an FTS5 phrase so user input is interpreted as a literal
@@ -771,6 +870,97 @@ mod tests {
                 ..Default::default()
             })
             .expect("should not error");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn semantic_lane_pushes_tag_filter_into_sql() {
+        // Audit invariant: when tags are active, the semantic-lane
+        // SQL must include the ``IN (...)`` clause AND bind exactly
+        // the tag + episode-id parameters in order. Without this,
+        // the JOIN materialises every embedding for the model tag
+        // and the engine only filters in Rust — wasting disk I/O
+        // linear in the pack size on what's usually a tightly
+        // scoped query.
+        let mut eps = std::collections::HashSet::new();
+        eps.insert("acquired_costco".to_string());
+        eps.insert("a16z_some-ep".to_string());
+        let (sql, params) = build_semantic_query("e5-small-v2", Some(&eps), 5_000);
+        assert!(
+            sql.contains("AND c.episode_id IN ("),
+            "tag-active SQL must push the filter into the WHERE: {sql}"
+        );
+        assert!(
+            sql.contains("LIMIT 5000"),
+            "scan cap must be in the SQL so SQLite can bound the scan: {sql}"
+        );
+        // ``HashSet`` iteration order is non-deterministic; the
+        // helper sorts episodes before binding so the parameter
+        // order is reproducible across runs.
+        assert_eq!(params[0], "e5-small-v2");
+        assert_eq!(params.len(), 3);
+        let mut bound_eps: Vec<&str> = params[1..].iter().map(String::as_str).collect();
+        bound_eps.sort();
+        assert_eq!(bound_eps, vec!["a16z_some-ep", "acquired_costco"]);
+    }
+
+    #[test]
+    fn semantic_lane_omits_in_clause_when_no_tags_active() {
+        // The other arm of the structural split: pure-semantic
+        // queries (no tag filter) hit every embedding for the
+        // model tag — bounded only by the scan cap.
+        let (sql, params) = build_semantic_query("e5-small-v2", None, 5_000);
+        assert!(
+            !sql.contains("IN ("),
+            "no tag filter -> no IN clause: {sql}"
+        );
+        assert!(sql.contains("LIMIT 5000"));
+        assert_eq!(params, vec!["e5-small-v2".to_string()]);
+    }
+
+    #[test]
+    fn semantic_lane_skips_scan_when_tags_match_no_episodes() {
+        // When the tag filter matches no episodes, the semantic
+        // lane must contribute nothing — and crucially must NOT
+        // execute a full-table scan over chunk_embeddings, since
+        // the answer is provably empty. We exercise this through
+        // the public ``search`` surface: a semantic query with an
+        // unmatched tag filter returns no hits AND does not error
+        // (the pre-fix behaviour at this boundary was an
+        // ``IN ()`` syntax error from the unguarded format!).
+        let store = PackStore::open_in_memory().unwrap();
+        seed(&store);
+        // Insert a stub embedding so the chunk_embeddings table
+        // is non-empty — verifies we skip the scan rather than
+        // simply finding nothing to scan.
+        let now = chrono::Utc::now().timestamp();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO chunk_embeddings (chunk_id, embedding, model_tag, created_at) VALUES (?, ?, ?, ?)",
+                rusqlite::params![
+                    "acquired_costco_001",
+                    encode_f32_blob(&[0.1, 0.2, 0.3]),
+                    "e5-small-v2",
+                    now,
+                ],
+            )
+            .unwrap();
+        let engine = SearchEngine::new(&store);
+        let hits = engine
+            .search(&SearchQuery {
+                text: "membership".into(),
+                tags: TagFilter {
+                    industry: vec!["industry-that-does-not-exist".into()],
+                    ..Default::default()
+                },
+                scope: SearchScope::IncludeEmbeddings,
+                query_embedding: Some(vec![0.1, 0.2, 0.3]),
+                semantic_model_tag: Some("e5-small-v2".into()),
+                limit: 5,
+                ..Default::default()
+            })
+            .expect("must not error on impossible tag filter");
         assert!(hits.is_empty());
     }
 }

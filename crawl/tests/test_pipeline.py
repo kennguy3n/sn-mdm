@@ -16,7 +16,7 @@ from crawl.crawlers.base import (
     NormalisedEpisode,
     RawEpisode,
 )
-from crawl.pipeline import DEFAULT_RIGHTS_ALLOWLIST, Pipeline
+from crawl.pipeline import DEFAULT_RIGHTS_ALLOWLIST, Pipeline, PublisherStats, exit_code_for
 
 
 class FakeCrawler(BaseCrawler):
@@ -275,3 +275,63 @@ def test_per_episode_rights_override_admits_when_publisher_blocks(
     assert parsed["rights_code"] == "cc_by"
     assert parsed["rights_summary"] == "One-off CC BY guest segment."
     assert "paywalled" not in DEFAULT_RIGHTS_ALLOWLIST
+
+
+def test_exit_code_zero_on_fresh_admit() -> None:
+    # Happy path: ingest admitted at least one episode.
+    totals = PublisherStats(
+        publisher_id="__totals__",
+        episodes_seen=3,
+        episodes_admitted=3,
+    )
+    assert exit_code_for(totals) == 0
+
+
+def test_exit_code_zero_on_fully_deduped_re_run() -> None:
+    # Regression: idempotent re-runs admit 0 episodes because every
+    # candidate hashes to a content_hash already in the governance
+    # log. That's the documented happy-path for a steady-state pack —
+    # the CLI must NOT return 1.
+    totals = PublisherStats(
+        publisher_id="__totals__",
+        episodes_seen=5,
+        episodes_admitted=0,
+        episodes_rejected_rights=0,
+        episodes_skipped_dedup=5,
+    )
+    assert exit_code_for(totals) == 0
+
+
+def test_exit_code_zero_when_only_rejected_by_rights() -> None:
+    # Rights gate doing its job is also success, not failure.
+    totals = PublisherStats(
+        publisher_id="__totals__",
+        episodes_seen=2,
+        episodes_admitted=0,
+        episodes_rejected_rights=2,
+    )
+    assert exit_code_for(totals) == 0
+
+
+def test_exit_code_one_on_silent_regression() -> None:
+    # The only condition that should return non-zero: episodes were
+    # seen, but none were admitted AND none were explained by either
+    # the rights gate or the dedup short-circuit. This is the signal
+    # that the HTML structure of every source changed at once and
+    # the parser is silently producing empty episodes.
+    totals = PublisherStats(
+        publisher_id="__totals__",
+        episodes_seen=4,
+        episodes_admitted=0,
+        episodes_rejected_rights=0,
+        episodes_skipped_dedup=0,
+    )
+    assert exit_code_for(totals) == 1
+
+
+def test_exit_code_zero_on_empty_run() -> None:
+    # No publishers / no episodes seen at all is also not a
+    # regression — could be a config that filters out everything,
+    # or a dry-run with no crawlers registered.
+    totals = PublisherStats(publisher_id="__totals__")
+    assert exit_code_for(totals) == 0
