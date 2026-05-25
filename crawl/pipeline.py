@@ -467,11 +467,34 @@ class Pipeline:
         rejected entries behaves identically to a pre-split
         pipeline.
         """
-        rejected = self._rejected_ids_by_publisher.get(publisher_id, ())
+        rejected = self._rejected_ids_by_publisher.get(publisher_id, set())
+        union = self._known_ids_by_publisher.get(publisher_id, set())
+        # Defensive lockstep check: ``_rejected_ids_by_publisher``
+        # must be a subset of ``_known_ids_by_publisher`` for the
+        # same publisher. The invariant is enforced at the write
+        # sites (boot-time in :meth:`_load_governance_state` and
+        # in-process via :meth:`_record_rejected_id`), but a
+        # future maintainer who pokes ``_rejected_ids_by_publisher``
+        # directly without also updating the union map would
+        # silently produce wrong skip sets — default mode would
+        # skip episodes the incremental-mode union view doesn't
+        # know about, breaking the "rejected ⊆ known" guarantee
+        # that the rest of the pipeline relies on. Failing loud
+        # here turns that latent bug into an immediate exception.
+        if not rejected.issubset(union):
+            leaked = rejected - union
+            raise AssertionError(
+                "lockstep invariant violation: "
+                f"publisher_id={publisher_id!r}, "
+                f"rejected set contains ids not in known union: "
+                f"{sorted(leaked)!r}. "
+                "Writes to ``_rejected_ids_by_publisher`` must go "
+                "through ``_record_rejected_id`` (or update both "
+                "maps in lockstep)."
+            )
         if not self.incremental:
             return frozenset(rejected)
-        admitted_union = self._known_ids_by_publisher.get(publisher_id, ())
-        return frozenset(admitted_union)
+        return frozenset(union)
 
     def _known_ids_for(self, publisher_id: str) -> frozenset[str]:
         """Return the set of ``episode_id``s known to the

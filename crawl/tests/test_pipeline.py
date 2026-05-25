@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from crawl.crawlers.base import (
     BaseCrawler,
     CrawlerConfig,
@@ -1490,6 +1492,68 @@ def test_pipeline_default_mode_second_call_pre_fetch_skips(tmp_path: Path) -> No
     assert len(governance) == 1
 
 
+def test_pre_fetch_skip_set_for_raises_on_lockstep_violation(
+    tmp_path: Path,
+) -> None:
+    """Defensive lockstep invariant: if a future maintainer
+    writes to ``_rejected_ids_by_publisher`` without also
+    updating ``_known_ids_by_publisher`` (or routes a write
+    around :meth:`_record_rejected_id`),
+    :meth:`_pre_fetch_skip_set_for` must raise immediately
+    rather than silently producing a wrong skip set.
+
+    Pins the round-2 review finding: the rejected map is a
+    subset of the union map by convention, so an enforcement
+    site at the single read path turns silent corruption
+    into a loud failure. The runtime cost is one ``issubset``
+    check per ``run_publisher`` invocation, which is
+    negligible.
+    """
+    cfg = _config()
+    pipeline = Pipeline(
+        configs={"fake": cfg},
+        packs_root=tmp_path,
+    )
+    # Simulate the future-maintainer bug: add an id to the
+    # rejected set without also adding it to the union.
+    pipeline._rejected_ids_by_publisher["fake"].add(
+        "fake_flagship_orphan-leak"
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        pipeline._pre_fetch_skip_set_for("fake")
+
+    msg = str(excinfo.value)
+    assert "lockstep invariant violation" in msg, msg
+    assert "fake_flagship_orphan-leak" in msg, msg
+    assert "_record_rejected_id" in msg, msg
+
+
+def test_pre_fetch_skip_set_for_holds_invariant_after_record_rejected(
+    tmp_path: Path,
+) -> None:
+    """Positive complement to the violation test: writes that
+    route through :meth:`_record_rejected_id` preserve the
+    invariant and :meth:`_pre_fetch_skip_set_for` returns the
+    expected mode-aware view without raising.
+    """
+    cfg = _config()
+    pipeline = Pipeline(
+        configs={"fake": cfg},
+        packs_root=tmp_path,
+    )
+    pipeline._record_rejected_id("fake", "fake_flagship_correctly-tracked")
+    # Default mode: rejected subset only.
+    assert pipeline._pre_fetch_skip_set_for("fake") == frozenset(
+        {"fake_flagship_correctly-tracked"}
+    )
+    # Incremental mode: full union.
+    pipeline.incremental = True
+    assert pipeline._pre_fetch_skip_set_for("fake") == frozenset(
+        {"fake_flagship_correctly-tracked"}
+    )
+
+
 def test_pipeline_default_mode_preserves_initial_sync_log_prefix(
     tmp_path: Path, caplog
 ) -> None:
@@ -1553,10 +1617,11 @@ def test_pipeline_default_mode_preserves_initial_sync_log_prefix(
         # non-empty-known branch inside ``incremental_sync``.
         # Without seeding, the empty-known branch falls back to
         # ``initial_sync`` directly and the test would trivially
-        # pass.
-        pipeline._rejected_ids_by_publisher["predisc"].add(
-            "predisc_flagship_phantom"
-        )
+        # pass. Route through ``_record_rejected_id`` so the
+        # rejected ⊆ known lockstep invariant is preserved
+        # (the runtime check in ``_pre_fetch_skip_set_for``
+        # would otherwise raise).
+        pipeline._record_rejected_id("predisc", "predisc_flagship_phantom")
 
         with caplog.at_level(logging.INFO, logger="crawl.crawlers.base"):
             pipeline.run(["predisc"])
