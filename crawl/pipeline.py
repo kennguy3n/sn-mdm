@@ -142,11 +142,18 @@ class Pipeline:
         # already-seen content (third invariant from the research).
         self._seen_content_hashes: set[str] = set()
         # Per-publisher set of ``episode_id``s admitted in some
-        # previous run. Only populated when ``incremental=True`` to
-        # avoid the governance-log re-read overhead on bootstrap
-        # runs. Lazily filled by :meth:`_known_ids_for`.
-        self._known_ids_by_publisher: dict[str, frozenset[str]] | None = None
-        self._load_known_hashes()
+        # previous run. Populated alongside ``_seen_content_hashes``
+        # in a single pass over the governance log so the file is
+        # never opened twice for the same data. In default-mode
+        # runs the map is still computed (the cost is one extra
+        # ``str.startswith`` per record) so a future call into
+        # ``_known_ids_for`` doesn't have to re-read; this also
+        # keeps the boot-time invariant readable — one method, one
+        # pass.
+        self._known_ids_by_publisher: dict[str, set[str]] = {
+            pid: set() for pid in self.configs
+        }
+        self._load_governance_state()
 
     # -- public surface --------------------------------------------------
 
@@ -236,6 +243,20 @@ class Pipeline:
 
                 self._write_governance(gov_fp, crawler, normalised, deprecated=False)
                 stats.episodes_admitted += 1
+                # Keep the in-memory skip set aligned with the
+                # governance log we just appended to so a second
+                # ``run_publisher(publisher_id)`` call within the
+                # same :class:`Pipeline` lifetime (duplicate entry
+                # in the ``targets`` list, or a deliberate two-
+                # pass run) attributes the skip to the incremental
+                # counter rather than the content-hash dedup
+                # counter. Without this update, the content-hash
+                # gate would still suppress the duplicate emission
+                # (output stays correct) but the operator-facing
+                # stats would be misleading.
+                self._known_ids_by_publisher.setdefault(
+                    publisher_id, set()
+                ).add(crawler.episode_id_for_slug(raw.episode_slug))
         # Read the incremental skip count the crawler accumulated
         # during this run. In non-incremental mode the counter
         # stays at 0 (we never call incremental_sync), so this is a
@@ -263,69 +284,23 @@ class Pipeline:
         """Return the set of ``episode_id``s previously admitted
         for ``publisher_id``.
 
-        Reads the governance log on first call and caches per-
-        publisher sets for the lifetime of the :class:`Pipeline`.
+        The underlying ``_known_ids_by_publisher`` map is populated
+        once at construction time (single pass over the governance
+        log alongside ``_seen_content_hashes``) and *kept in sync*
+        as the current run admits new episodes — see
+        :meth:`run_publisher`, which adds each freshly-admitted
+        episode_id to the publisher's set. This means a second
+        ``run_publisher`` call for the same publisher inside one
+        :class:`Pipeline` lifetime (e.g. duplicate entry in the
+        ``targets`` list) correctly attributes the skip to the
+        incremental counter, not the content-hash dedup counter.
         Only non-deprecated rows count — a rights-rejected episode
         is *not* in the skip set because a future crawl could
         legitimately re-admit it under a different rights code.
-        Membership is computed against the canonical episode_id
-        produced by :meth:`BaseCrawler.episode_id_for_slug`, which
-        is the same identifier the governance log writes.
         """
-        if self._known_ids_by_publisher is None:
-            self._known_ids_by_publisher = self._load_known_episode_ids()
-        return self._known_ids_by_publisher.get(publisher_id, frozenset())
-
-    def _load_known_episode_ids(self) -> dict[str, frozenset[str]]:
-        """Walk the governance log once and group non-deprecated
-        ``episode_id``s by publisher.
-
-        The episode_id format is
-        ``{publisher_id}_{series_id}_{slug}`` — we partition by
-        prefix-matching every configured publisher_id so a
-        publisher_id that happens to contain underscores (none of
-        the current registry does, but the format permits it)
-        still groups correctly. We *do not* try to reverse-parse
-        the episode_id back into its components: that would
-        require knowing every publisher's series_id and is
-        unnecessary because the pipeline already has the
-        :class:`CrawlerConfig` registry to hand.
-        """
-        gov = self.packs_root / "governance" / "rights_log.jsonl"
-        per_publisher: dict[str, set[str]] = {pid: set() for pid in self.configs}
-        if not gov.exists():
-            return {pid: frozenset(s) for pid, s in per_publisher.items()}
-        # Pre-build a list of ``(publisher_id, prefix)`` pairs
-        # sorted by descending prefix length so a longer prefix
-        # (e.g. ``acquired_long_form_``) wins over a shorter one
-        # (e.g. ``acquired_``) on partition. Today no two
-        # registered publishers share a prefix, so the order
-        # doesn't matter; the sort is defence-in-depth for future
-        # additions.
-        prefixes = sorted(
-            ((pid, f"{pid}_") for pid in self.configs),
-            key=lambda kv: len(kv[1]),
-            reverse=True,
-        )
-        with gov.open("r", encoding="utf-8") as fp:
-            for line in fp:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("deprecated"):
-                    continue
-                ep_id = rec.get("episode_id")
-                if not isinstance(ep_id, str) or not ep_id:
-                    continue
-                for pid, prefix in prefixes:
-                    if ep_id.startswith(prefix):
-                        per_publisher[pid].add(ep_id)
-                        break
-        return {pid: frozenset(s) for pid, s in per_publisher.items()}
+        # frozenset() on every call would defeat the in-process
+        # update path; we hand out a frozen view of the live set.
+        return frozenset(self._known_ids_by_publisher.get(publisher_id, ()))
 
     def _rights_gate_allows(self, rights_code: str) -> bool:
         return rights_code.lower() in self.rights_allowlist
@@ -361,10 +336,55 @@ class Pipeline:
         fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
         fp.flush()
 
-    def _load_known_hashes(self) -> None:
+    def _load_governance_state(self) -> None:
+        """Walk the governance log exactly once and populate both
+        ``_seen_content_hashes`` and ``_known_ids_by_publisher``.
+
+        The governance log is append-only and is the single source
+        of truth for two boot-time facts:
+
+        1. Which ``content_hash`` digests are already represented
+           in the pack (used by the post-fetch dedup gate).
+        2. Which ``episode_id``s have been admitted for each
+           publisher (used by the pre-fetch incremental skip).
+
+        Reading the file once and populating both maps in the same
+        loop is strictly cheaper than two passes — the dominant
+        cost is the JSON parse, which we'd otherwise pay twice per
+        record — and keeps the boot-time semantics of the two
+        gates colocated.
+
+        Latest-wins note: the log is documented as effectively
+        append-once per ``episode_id`` (the two upstream gates,
+        content-hash dedup in default mode and incremental skip in
+        ``--incremental`` mode, both prevent a second entry for an
+        already-admitted episode from being written). If a future
+        change ever permits a non-deprecated row followed by a
+        deprecated row for the same episode_id, the deprecated row
+        would NOT remove the earlier ``episode_id`` from the skip
+        set here, and the incremental gate would continue to
+        skip it. That contract is intentional today (a rejection
+        happening *after* an admission is a curation decision the
+        operator made deliberately, and we should not silently
+        force a re-fetch of the same content), but a future
+        latest-wins semantics would need to track the *last* row
+        per episode_id rather than the *first* match.
+        """
         gov = self.packs_root / "governance" / "rights_log.jsonl"
         if not gov.exists():
             return
+        # Pre-build a list of ``(publisher_id, prefix)`` pairs
+        # sorted by descending prefix length so a longer prefix
+        # (e.g. ``acquired_long_form_``) wins over a shorter one
+        # (e.g. ``acquired_``) on partition. Today no two
+        # registered publishers share a prefix, so the order
+        # doesn't matter; the sort is defence-in-depth for future
+        # additions.
+        prefixes = sorted(
+            ((pid, f"{pid}_") for pid in self.configs),
+            key=lambda kv: len(kv[1]),
+            reverse=True,
+        )
         with gov.open("r", encoding="utf-8") as fp:
             for line in fp:
                 line = line.strip()
@@ -374,11 +394,20 @@ class Pipeline:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if rec.get("deprecated"):
+                    # Don't carry rejection hashes or ids forward
+                    # — a re-crawl could later succeed under a
+                    # different rights code.
+                    continue
                 ch = rec.get("content_hash")
-                # Don't carry rejection hashes forward — a re-crawl
-                # could later succeed under a different rights code.
-                if isinstance(ch, str) and ch and not rec.get("deprecated"):
+                if isinstance(ch, str) and ch:
                     self._seen_content_hashes.add(ch)
+                ep_id = rec.get("episode_id")
+                if isinstance(ep_id, str) and ep_id:
+                    for pid, prefix in prefixes:
+                        if ep_id.startswith(prefix):
+                            self._known_ids_by_publisher[pid].add(ep_id)
+                            break
 
 
 # ------------------------------------------------------------------

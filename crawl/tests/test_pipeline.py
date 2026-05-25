@@ -792,6 +792,41 @@ def test_pipeline_incremental_skip_count_rolls_into_stats(
     assert stats.episodes_skipped_incremental == 1
 
 
+def test_pipeline_in_memory_skip_set_updates_after_admission(
+    tmp_path: Path,
+) -> None:
+    """Regression for ANALYSIS_0005: episodes admitted during the
+    current ``run_publisher`` call must land in
+    ``_known_ids_by_publisher`` so a second invocation for the same
+    publisher inside the same :class:`Pipeline` lifetime (e.g. a
+    duplicate entry in the ``targets`` list) correctly attributes
+    the skip to the incremental counter rather than the
+    content-hash dedup counter. Without the in-loop update, the
+    content-hash gate would still suppress the duplicate emission
+    (so the output stays correct) but the operator-facing stats
+    would mis-bucket the skip.
+    """
+    _register_fake()
+    pipeline = Pipeline(
+        configs={"fake": _config()},
+        packs_root=tmp_path,
+        incremental=True,
+    )
+    # Bootstrap: empty governance log, base incremental_sync falls
+    # back to initial_sync, FakeCrawler yields one episode, it gets
+    # admitted, governance log gets the entry, the in-memory map
+    # gets the entry.
+    first = pipeline.run_publisher("fake")
+    assert first.episodes_admitted == 1
+    assert first.episodes_skipped_incremental == 0
+
+    # The freshly-admitted episode_id must be visible in the
+    # per-publisher skip set without re-reading the governance log.
+    assert pipeline._known_ids_by_publisher["fake"] == {
+        "fake_flagship_hello-world"
+    }
+
+
 def test_incremental_sync_log_line_uses_incremental_prefix(
     tmp_path: Path, caplog
 ) -> None:
@@ -810,9 +845,12 @@ def test_incremental_sync_log_line_uses_incremental_prefix(
     msgs = [rec.getMessage() for rec in caplog.records]
     # The enumeration line is tagged with the incremental prefix.
     assert any("incremental_sync — 1 seed + 0 discovered" in m for m in msgs)
-    # And the per-run summary names the skip count.
+    # And the per-run summary names the skip + attempt + error counts
+    # (the previous "candidates fetched" tag conflated successful
+    # fetches with failed ones — see ANALYSIS_0004 from the round-1
+    # Devin Review pass).
     assert any(
-        "incremental_sync — 1 known skipped, 0 candidates fetched" in m
+        "incremental_sync — 1 known skipped, 0 attempted, 0 failed" in m
         for m in msgs
     )
 

@@ -958,21 +958,34 @@ class BaseCrawler:
 
         slugs = self._enumerate_slugs(log_prefix="incremental_sync")
         skipped = 0
+        attempted = 0
+        errors = 0
         for slug in slugs:
             if self.episode_id_for_slug(slug) in known:
                 skipped += 1
                 continue
+            attempted += 1
             try:
                 yield self.fetch_transcript(slug)
             except Exception as exc:  # noqa: BLE001
+                errors += 1
                 LOG.warning("fetch_transcript(%s) failed: %s", slug, exc)
                 continue
         self.last_incremental_skip_count = skipped
+        # ``attempted`` is the count that reached ``fetch_transcript``;
+        # ``errors`` is the subset of those that raised. The arithmetic
+        # ``attempted - errors`` is the count that actually yielded a
+        # ``RawEpisode`` to the pipeline. We log all three so an
+        # operator reading the noise can distinguish "skipped by
+        # cursor" from "tried but blew up" from "successfully fetched"
+        # rather than conflating the latter two under a single
+        # "candidates fetched" tag.
         LOG.info(
-            "%s: incremental_sync — %d known skipped, %d candidates fetched",
+            "%s: incremental_sync — %d known skipped, %d attempted, %d failed",
             self.publisher_id,
             skipped,
-            len(slugs) - skipped,
+            attempted,
+            errors,
         )
 
     def fetch_transcript(self, episode_slug: str) -> RawEpisode:
