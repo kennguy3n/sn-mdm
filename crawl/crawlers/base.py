@@ -931,6 +931,8 @@ class BaseCrawler:
     def incremental_sync(
         self,
         known_episode_ids: frozenset[str] | None = None,
+        *,
+        log_prefix: str = "incremental_sync",
     ) -> Iterator[RawEpisode]:
         """Pre-fetch skip pull — fetch only slugs whose canonical
         ``episode_id`` is not already present in
@@ -1001,11 +1003,16 @@ class BaseCrawler:
         if not known:
             # Empty cursor — fall through to the full walk. This is
             # the bootstrap case (no governance log yet) and is
-            # documented as the safe default.
+            # documented as the safe default. The full walk is the
+            # boot-mode path: it always emits the ``initial_sync —``
+            # log tag regardless of what ``log_prefix`` says here,
+            # because :meth:`initial_sync` itself hard-codes that
+            # tag (and operators rely on grepping for it to
+            # identify the boot phase).
             yield from self.initial_sync()
             return
 
-        slugs = self._enumerate_slugs(log_prefix="incremental_sync")
+        slugs = self._enumerate_slugs(log_prefix=log_prefix)
         skipped = 0
         attempted = 0
         errors = 0
@@ -1030,8 +1037,9 @@ class BaseCrawler:
         # rather than conflating the latter two under a single
         # "candidates fetched" tag.
         LOG.info(
-            "%s: incremental_sync — %d known skipped, %d attempted, %d failed",
+            "%s: %s — %d known skipped, %d attempted, %d failed",
             self.publisher_id,
+            log_prefix,
             skipped,
             attempted,
             errors,

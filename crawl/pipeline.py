@@ -357,10 +357,21 @@ class Pipeline:
                 self._known_ids_by_publisher.setdefault(
                     publisher_id, set()
                 ).add(crawler.episode_id_for_slug(raw.episode_slug))
-        # Read the incremental skip count the crawler accumulated
-        # during this run. In non-incremental mode the counter
-        # stays at 0 (we never call incremental_sync), so this is a
-        # cheap no-op for the default flow.
+        # Read the pre-fetch skip count the crawler accumulated
+        # during this run. Both modes route episodes through
+        # :meth:`BaseCrawler.incremental_sync` now (only the
+        # skip-set composition differs — see
+        # :meth:`_pre_fetch_skip_set_for`), so the counter is
+        # populated in default mode too. In default mode the
+        # count reflects persistently-rejected episodes pre-
+        # fetch-skipped; in ``--incremental`` mode it adds
+        # previously-admitted episodes on top of that. The
+        # ``getattr`` fallback is a defence-in-depth against a
+        # crawler that raised before reaching the counter assign
+        # at the end of ``incremental_sync`` — we'd already have
+        # reset it to ``0`` at the top of ``run_publisher`` (line
+        # ~213) but a partially-consumed generator could
+        # theoretically leave it unset on an older Python.
         stats.episodes_skipped_incremental = getattr(
             crawler, "last_incremental_skip_count", 0
         )
@@ -385,8 +396,29 @@ class Pipeline:
         # the full :meth:`initial_sync` walk, so default-mode
         # behaviour is preserved when the governance log is empty
         # or has no deprecated-still-rejected entries.
+        #
+        # ``log_prefix`` is threaded down so the operator-facing
+        # log tag matches the pipeline *mode* the operator
+        # selected on the CLI, not the implementation method the
+        # pipeline happens to dispatch through. Default mode
+        # always logs the historical ``initial_sync —`` prefix
+        # (operators have grepped for it for the lifetime of the
+        # codebase); ``--incremental`` mode logs ``incremental_sync —``.
+        # Without this, the prefix would flip the first time a
+        # default-mode publisher accumulates a persistently-
+        # rejected episode (because the skip set switches from
+        # empty to non-empty, which is the
+        # initial-fallback-vs-skip-fast-path branch inside
+        # ``BaseCrawler.incremental_sync``), and operators
+        # would lose the ability to grep by mode.
         skip_set = self._pre_fetch_skip_set_for(crawler.publisher_id)
-        episodes = list(crawler.incremental_sync(known_episode_ids=skip_set))
+        log_prefix = "incremental_sync" if self.incremental else "initial_sync"
+        episodes = list(
+            crawler.incremental_sync(
+                known_episode_ids=skip_set,
+                log_prefix=log_prefix,
+            )
+        )
         return episodes
 
     def _record_rejected_id(self, publisher_id: str, episode_id: str) -> None:
@@ -443,15 +475,26 @@ class Pipeline:
 
     def _known_ids_for(self, publisher_id: str) -> frozenset[str]:
         """Return the set of ``episode_id``s known to the
-        governance log for ``publisher_id``.
+        governance log for ``publisher_id`` — the *union* view
+        (admitted + persistently-rejected).
 
-        This is the *union* view — admitted episodes plus
-        persistently-rejected episodes (deprecated rows whose
-        ``rights_code`` is still outside the current allowlist).
-        It's the historically-named accessor; the mode-aware
-        skip-set the pipeline actually feeds to the crawler is
-        :meth:`_pre_fetch_skip_set_for`, which narrows to just
-        the rejected subset in default mode.
+        Not called by the pipeline runtime anymore — the
+        mode-aware skip set the pipeline actually feeds to the
+        crawler is :meth:`_pre_fetch_skip_set_for`, which
+        narrows to just the rejected subset in default mode and
+        widens back to the full union in ``--incremental``
+        mode. Kept as a public-ish introspection accessor for
+        test assertions and operator debugging: it gives a
+        mode-independent answer to the question "what does the
+        governance log already know about this publisher?"
+        without callers having to reach into the private
+        ``_known_ids_by_publisher`` dict. Test sites that
+        currently rely on it: the in-memory-skip-set regression
+        tests in ``test_pipeline.py`` (~5 call sites at the time
+        of writing). If those tests ever migrate to inspecting
+        ``_known_ids_by_publisher`` and
+        ``_rejected_ids_by_publisher`` directly, this method can
+        be removed.
 
         The underlying ``_known_ids_by_publisher`` map is populated
         once at construction time (single pass over the governance

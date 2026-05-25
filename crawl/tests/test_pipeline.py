@@ -58,7 +58,7 @@ class FakeCrawler(BaseCrawler):
             summary="A test episode.",
         )
 
-    def incremental_sync(self, known_episode_ids=None):
+    def incremental_sync(self, known_episode_ids=None, *, log_prefix="incremental_sync"):
         """Override to wrap :meth:`initial_sync` with the
         pre-fetch skip filter so the test fixture conforms to
         the base contract documented at
@@ -85,6 +85,20 @@ class FakeCrawler(BaseCrawler):
         so :class:`PerEpisodeRightsCrawler` and the inline
         ``TwinSlugDedupCrawler`` in the regression-test below
         don't need their own copy.
+
+        ``log_prefix`` is accepted (to match the base signature
+        the pipeline threads it through with) but ignored — the
+        fixture doesn't emit log lines because the test crawlers
+        bypass :meth:`_enumerate_slugs` and :meth:`fetch_transcript`
+        entirely. The production error-handling path
+        (try/except around ``fetch_transcript``, error counter
+        in the summary log line) is correspondingly also absent
+        from this override; the test crawlers don't raise from
+        :meth:`initial_sync`, so there's nothing to wrap. The
+        production path is exercised by
+        :func:`test_incremental_sync_log_line_uses_incremental_prefix`
+        et al. which drive ``DiscoveryMergeCrawler`` through the
+        real base implementation.
         """
         known = frozenset(known_episode_ids or ())
         self.last_incremental_skip_count = 0
@@ -189,7 +203,7 @@ def test_default_mode_skips_persistently_rejected_pre_fetch(tmp_path: Path) -> N
     Without this, a publisher with a paywalled rights_code (or
     any code outside the current allowlist) would re-fetch the
     same episode, re-run the gate, and append another deprecated
-    governance row on every run \u2014 producing unbounded log
+    governance row on every run — producing unbounded log
     growth for zero new output. The fix splits the boot-time
     skip-set load so the rejected subset is fed to the crawler
     in both modes; only the admitted subset is gated behind
@@ -223,7 +237,7 @@ def test_default_mode_skips_persistently_rejected_pre_fetch(tmp_path: Path) -> N
 
     # Second run: same default mode, same policy. The episode is
     # in the persistently-rejected set and must be skipped before
-    # the (synthetic) HTTP fetch \u2014 i.e. ``episodes_seen == 0``,
+    # the (synthetic) HTTP fetch — i.e. ``episodes_seen == 0``,
     # the skip is attributed to the incremental counter, and no
     # new deprecated row is appended.
     second_pipeline = Pipeline(
@@ -252,7 +266,7 @@ def test_default_mode_does_not_skip_admitted_pre_fetch(tmp_path: Path) -> None:
     """Default-mode re-runs must still re-fetch previously-admitted
     episodes so the content-hash dedup gate can pick up a
     legitimate transcript update. Only the *rejected* subset is
-    in the default-mode pre-fetch skip set \u2014 admitted episodes
+    in the default-mode pre-fetch skip set — admitted episodes
     are routed through ``initial_sync`` \u2192 ``normalize`` \u2192 dedup
     as they were before the split.
 
@@ -276,7 +290,7 @@ def test_default_mode_does_not_skip_admitted_pre_fetch(tmp_path: Path) -> None:
     second = second_pipeline.run(["fake"])
     second_stats = second.by_publisher["fake"]
     # The episode WAS fetched (``episodes_seen == 1``) and got
-    # absorbed by the content-hash dedup gate \u2014 NOT pre-fetch-
+    # absorbed by the content-hash dedup gate — NOT pre-fetch-
     # skipped. This is the contract that lets a legitimate
     # transcript update be detected on a re-run.
     assert second_stats.episodes_seen == 1
@@ -287,7 +301,7 @@ def test_default_mode_does_not_skip_admitted_pre_fetch(tmp_path: Path) -> None:
 def test_default_mode_skip_yields_to_allowlist_change(tmp_path: Path) -> None:
     """If the operator extends the allowlist between runs to cover
     a previously-rejected ``rights_code``, the second default-mode
-    run must NOT skip the episode \u2014 the rights gate has to get
+    run must NOT skip the episode — the rights gate has to get
     another shot at admitting it under the new policy.
 
     Exercises the policy-aware ``still_rejected`` guard in
@@ -321,7 +335,7 @@ def test_default_mode_skip_yields_to_allowlist_change(tmp_path: Path) -> None:
     second = second_pipeline.run(["fake"])
     second_stats = second.by_publisher["fake"]
     # The episode was re-fetched and the rights gate admitted it
-    # under the relaxed allowlist \u2014 producing a fresh
+    # under the relaxed allowlist — producing a fresh
     # non-deprecated governance row.
     assert second_stats.episodes_seen == 1
     assert second_stats.episodes_admitted == 1
@@ -1399,16 +1413,16 @@ def test_fake_crawler_incremental_sync_filters_known(tmp_path: Path) -> None:
 
     Without the override, the inherited base
     :meth:`BaseCrawler.incremental_sync` would route through
-    :meth:`_enumerate_slugs` \u2014 which composes ``config.episodes``
+    :meth:`_enumerate_slugs` — which composes ``config.episodes``
     and :meth:`_discover_episode_slugs`, both empty/default on
-    these fixtures \u2014 and therefore silently yield zero episodes
+    these fixtures — and therefore silently yield zero episodes
     for any non-empty ``known`` set. The bug was previously
     latent because no test exercised the FakeCrawler-incremental-
     with-non-empty-known path; pin it here so a future regression
     surfaces immediately.
     """
     crawler = FakeCrawler(_config(), tmp_path)
-    # Empty known: behaves identically to ``initial_sync`` \u2014 one
+    # Empty known: behaves identically to ``initial_sync`` — one
     # episode yielded, skip counter stays at 0.
     yielded = list(crawler.incremental_sync(known_episode_ids=frozenset()))
     assert [r.episode_slug for r in yielded] == ["hello-world"]
@@ -1448,7 +1462,7 @@ def test_pipeline_default_mode_second_call_pre_fetch_skips(tmp_path: Path) -> No
     pipeline = Pipeline(
         configs={"fake": _config("paywalled")},
         packs_root=tmp_path,
-        # Default mode \u2014 ``incremental=False``.
+        # Default mode — ``incremental=False``.
     )
     first = pipeline.run_publisher("fake")
     assert first.episodes_seen == 1
@@ -1466,7 +1480,7 @@ def test_pipeline_default_mode_second_call_pre_fetch_skips(tmp_path: Path) -> No
     assert second.episodes_rejected_rights == 0
     assert second.episodes_skipped_incremental == 1
     # The governance log still has exactly one deprecated row from
-    # the first call \u2014 the second call did NOT append.
+    # the first call — the second call did NOT append.
     governance = (
         (tmp_path / "governance" / "rights_log.jsonl")
         .read_text()
@@ -1474,6 +1488,173 @@ def test_pipeline_default_mode_second_call_pre_fetch_skips(tmp_path: Path) -> No
         .splitlines()
     )
     assert len(governance) == 1
+
+
+def test_pipeline_default_mode_preserves_initial_sync_log_prefix(
+    tmp_path: Path, caplog
+) -> None:
+    """Default-mode pipeline runs always emit the
+    ``initial_sync —`` log tag, regardless of whether the
+    per-publisher rejected set is empty or not.
+
+    Round-10 follow-up regression. After the skip-set split,
+    default-mode runs route episodes through
+    :meth:`BaseCrawler.incremental_sync` with the
+    rejected-only subset. Without an explicit log prefix
+    override, the moment a publisher accumulated a persistently-
+    rejected episode the operator-facing log tag would silently
+    flip from ``initial_sync —`` to ``incremental_sync —``,
+    breaking the long-standing convention that operators grep
+    by mode rather than by implementation method. The
+    :meth:`Pipeline._iter_episodes` call site threads
+    ``log_prefix="initial_sync"`` so the tag remains stable.
+
+    Drives the path via the pipeline (which is where the
+    prefix decision lives), not directly via the crawler.
+    """
+    import logging
+
+    from crawl import crawlers
+
+    class _PreDiscoveredCrawler(DiscoveryMergeCrawler):
+        publisher_id = "predisc"
+
+        def __init__(self, config, packs_root) -> None:
+            super().__init__(
+                config=config,
+                packs_root=packs_root,
+                discovered=["disc-b"],
+            )
+
+    crawlers._REGISTRY["predisc"] = _PreDiscoveredCrawler  # type: ignore[attr-defined]
+    try:
+        cfg_base = _merge_config(seeds=["seed-a"])
+        from crawl.crawlers.base import CrawlerConfig as _CC
+        cfg = _CC(
+            publisher_id="predisc",
+            publisher_name=cfg_base.publisher_name,
+            base_url=cfg_base.base_url,
+            rights_code=cfg_base.rights_code,
+            rights_summary=cfg_base.rights_summary,
+            country_region=cfg_base.country_region,
+            industry_tags=cfg_base.industry_tags,
+            function_tags=cfg_base.function_tags,
+            business_model_tags=cfg_base.business_model_tags,
+            source_type=cfg_base.source_type,
+            language=cfg_base.language,
+            host=cfg_base.host,
+            episodes=["seed-a"],
+        )
+        pipeline = Pipeline(
+            configs={"predisc": cfg},
+            packs_root=tmp_path,
+        )
+        # Seed the rejected set so the pipeline takes the
+        # non-empty-known branch inside ``incremental_sync``.
+        # Without seeding, the empty-known branch falls back to
+        # ``initial_sync`` directly and the test would trivially
+        # pass.
+        pipeline._rejected_ids_by_publisher["predisc"].add(
+            "predisc_flagship_phantom"
+        )
+
+        with caplog.at_level(logging.INFO, logger="crawl.crawlers.base"):
+            pipeline.run(["predisc"])
+
+        msgs = [rec.getMessage() for rec in caplog.records]
+        # The enumeration line is tagged with the initial-sync
+        # prefix — the historical default-mode convention.
+        assert any(
+            "initial_sync — 1 seed + 1 discovered" in m for m in msgs
+        ), msgs
+        # And the per-run summary uses the same prefix — a
+        # default-mode operator grepping ``initial_sync —``
+        # finds both the enumeration and summary lines.
+        assert any(
+            "initial_sync — 0 known skipped, 2 attempted, 0 failed" in m
+            for m in msgs
+        ), msgs
+        # The ``incremental_sync —`` tag does NOT appear in
+        # default-mode logs.
+        assert not any("incremental_sync —" in m for m in msgs), msgs
+    finally:
+        crawlers._REGISTRY.pop("predisc", None)
+
+
+def test_pipeline_incremental_mode_uses_incremental_log_prefix(
+    tmp_path: Path, caplog
+) -> None:
+    """Mirror of
+    :func:`test_pipeline_default_mode_preserves_initial_sync_log_prefix`
+    for ``--incremental`` mode: the same pipeline path,
+    different mode, different log tag. Pins the other half of
+    the mode-aware prefix contract.
+    """
+    import logging
+
+    from crawl import crawlers
+
+    class _PreDiscoveredCrawler(DiscoveryMergeCrawler):
+        publisher_id = "predisc"
+
+        def __init__(self, config, packs_root) -> None:
+            super().__init__(
+                config=config,
+                packs_root=packs_root,
+                discovered=["disc-b"],
+            )
+
+    crawlers._REGISTRY["predisc"] = _PreDiscoveredCrawler  # type: ignore[attr-defined]
+    try:
+        cfg_base = _merge_config(seeds=["seed-a"])
+        from crawl.crawlers.base import CrawlerConfig as _CC
+        cfg = _CC(
+            publisher_id="predisc",
+            publisher_name=cfg_base.publisher_name,
+            base_url=cfg_base.base_url,
+            rights_code=cfg_base.rights_code,
+            rights_summary=cfg_base.rights_summary,
+            country_region=cfg_base.country_region,
+            industry_tags=cfg_base.industry_tags,
+            function_tags=cfg_base.function_tags,
+            business_model_tags=cfg_base.business_model_tags,
+            source_type=cfg_base.source_type,
+            language=cfg_base.language,
+            host=cfg_base.host,
+            episodes=["seed-a"],
+        )
+        pipeline = Pipeline(
+            configs={"predisc": cfg},
+            packs_root=tmp_path,
+            incremental=True,
+        )
+        # Seed the union set so the pipeline takes the
+        # non-empty-known branch.
+        pipeline._known_ids_by_publisher["predisc"].add(
+            "predisc_flagship_phantom"
+        )
+
+        with caplog.at_level(logging.INFO, logger="crawl.crawlers.base"):
+            pipeline.run(["predisc"])
+
+        msgs = [rec.getMessage() for rec in caplog.records]
+        assert any(
+            "incremental_sync — 1 seed + 1 discovered" in m for m in msgs
+        ), msgs
+        assert any(
+            "incremental_sync — 0 known skipped, 2 attempted, 0 failed" in m
+            for m in msgs
+        ), msgs
+        # The ``initial_sync —`` tag does NOT appear in
+        # incremental-mode logs (other than any legitimate
+        # boot-phase ``initial_sync`` from a downstream fallback,
+        # which isn't triggered here because the seeded skip set
+        # forces the non-empty-known path).
+        assert not any(
+            "initial_sync — 1 seed + 1 discovered" in m for m in msgs
+        ), msgs
+    finally:
+        crawlers._REGISTRY.pop("predisc", None)
 
 
 def test_initial_sync_log_line_keeps_initial_prefix(
