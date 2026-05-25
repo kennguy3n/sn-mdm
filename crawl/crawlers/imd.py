@@ -33,8 +33,16 @@ _INDEX_URL = "https://www.imd.org/ibyimd/category/podcasts/"
 # trailing ``[a-z0-9]`` anchor on the capture forces at least one
 # non-slash terminal segment so we don't accept directory-style
 # slugs like ``leaders-unplugged/`` either.
+# The domain group is optional so the walker matches both
+# absolute (``https://www.imd.org/ibyimd/podcasts/<slug>``) and
+# relative (``/ibyimd/podcasts/<slug>``) hrefs. WordPress themes
+# frequently emit relative links from the same template
+# rendering pass that produces canonical permalinks elsewhere
+# on the page, so anchoring on the absolute form alone would
+# silently miss episodes — mirror the same handling our other
+# HTML-index walkers use (acquired, exit_five, frog).
 _HREF_RE = re.compile(
-    r"^https?://(?:www\.)?imd\.org/ibyimd/podcasts/"
+    r"^(?:https?://(?:www\.)?imd\.org)?/ibyimd/podcasts/"
     r"(?!page/)"
     r"([a-z0-9][a-z0-9\-/]*[a-z0-9])/?$"
 )

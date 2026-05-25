@@ -51,7 +51,7 @@ Every episode is tagged across the 5 families
 | WEF Radio Davos                        | `wef_radio_davos.py`          | `weforum.org/podcasts/radio-davos/episodes/{slug}`                   | `cc_by_nc_nd`             | global            |
 | Deutsche Bank                          | `deutsche_bank.py`            | `corporates.db.com/multimedia/{slug}` + `db.com/news/detail/{slug}`  | `free_access_copyrighted` | Germany / APAC    |
 | UK NCSC Toolkit for Boards             | `ncsc.py`                     | `ncsc.gov.uk/information/toolkit-for-boards-audio-transcripts`       | `ogl_v3`                  | UK                |
-| Microsoft Cyber (WWPS)                 | `microsoft_cyber.py`          | `wwps.microsoft.com/blog/episodes/{slug}` + PDF transcripts          | `free_access_copyrighted` | US / global       |
+| Microsoft Cyber (WWPS)                 | `microsoft_cyber.py`          | `wwps.microsoft.com/{episodes,infrastructure-episodes}/{slug}` + PDF transcripts | `free_access_copyrighted` | US / global       |
 | Thomson Reuters Legal                  | `thomson_reuters.py`          | `thomsonreuters.com/en-us/posts/legal/{slug}` HTML transcripts       | `free_access_copyrighted` | US / global       |
 
 ## Tranche 2 — specialist overlays (2)
