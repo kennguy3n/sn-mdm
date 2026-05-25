@@ -22,6 +22,13 @@ _EPISODE_SITEMAP_URL = "https://mastersofscale.com/episode-sitemap.xml"
 _EPISODE_LOC_RE = re.compile(
     r"<loc>\s*https?://mastersofscale\.com/episode/([a-z0-9][a-z0-9\-]*)/?\s*</loc>"
 )
+# Heading-tag matchers used by :meth:`MastersOfScaleCrawler._normalize_html_bytes`.
+# Lifted to module scope to match the convention used by other crawlers
+# (e.g. ``imd._HREF_RE``) and to avoid re-compiling on every page render.
+_HEADING_RE = re.compile(r"^h[1-6]$")
+_TRANSCRIPT_ANCHOR_RE = re.compile(r"^transcript\b")
+_TOP_HEADING_RE = re.compile(r"^h[1-2]$")
+_SUB_HEADING_RE = re.compile(r"^h[3-6]$")
 
 
 class MastersOfScaleCrawler(BaseCrawler):
@@ -132,22 +139,20 @@ class MastersOfScaleCrawler(BaseCrawler):
         # transcript", which is the wrong anchor and would emit
         # the page chrome as a "transcript" for audio-only shows.
         target = None
-        for h in soup.find_all(re.compile(r"^h[1-6]$")):
+        for h in soup.find_all(_HEADING_RE):
             text = h.get_text(" ", strip=True).lower()
-            if re.match(r"^transcript\b", text):
+            if _TRANSCRIPT_ANCHOR_RE.match(text):
                 target = h
                 break
         if target is None:
             return ""
         blocks: list[str] = []
         captured_ids: set[int] = set()
-        top_heading_re = re.compile(r"^h[1-2]$")
-        sub_heading_re = re.compile(r"^h[3-6]$")
         for sib in target.find_all_next():
             name = getattr(sib, "name", None)
             if name is None:
                 continue
-            if top_heading_re.match(name):
+            if _TOP_HEADING_RE.match(name):
                 break
             # Skip descendants of an element we already emitted —
             # otherwise ``<blockquote><p>X</p></blockquote>``
@@ -161,7 +166,7 @@ class MastersOfScaleCrawler(BaseCrawler):
                     blocks.append(text)
                     captured_ids.add(id(sib))
                 continue
-            if sub_heading_re.match(name):
+            if _SUB_HEADING_RE.match(name):
                 text = sib.get_text(" ", strip=True)
                 if text:
                     level = int(name[1])
