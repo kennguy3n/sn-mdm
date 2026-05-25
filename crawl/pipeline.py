@@ -571,25 +571,46 @@ def exit_code_for(totals: PublisherStats) -> int:
 
     Non-zero only when every publisher failed to admit anything *and*
     the failure can't be explained by any of the documented
-    short-circuits: the rights gate, the content-hash dedup gate,
-    or the incremental skip predicate. The pipeline is documented as
-    idempotent — re-running on a packs root that already contains
-    every episode will (correctly) admit nothing because every
-    episode hashes to a ``content_hash`` that's already in the
-    governance log (default mode) or its ``episode_id`` is in the
-    incremental skip set (``--incremental`` mode). Likewise a run
-    that only saw rights-rejected episodes is doing exactly what
-    the gate asked of it. Only return non-zero when *all four*
-    explanations are absent — that's the signal of a real crawl
-    regression (e.g. every source's HTML changed shape and parses
-    to empty), not normal steady-state.
+    short-circuits. The pipeline is documented as idempotent —
+    re-running on a packs root that already contains every episode
+    will (correctly) admit nothing. There are three legitimate
+    "no admits" paths, and each one is observable in the totals:
+
+    1. **No episodes reached the pipeline at all** (``episodes_seen
+       == 0``). This is the steady-state ``--incremental`` case —
+       the crawler short-circuits known slugs *before* the fetch,
+       so they never become "seen". It's also what you get from a
+       publisher whose discovery returns empty for legitimate
+       reasons. Either way, zero-seen is not a regression and we
+       return 0.
+    2. **Some episodes were seen and all were content-hash-deduped**
+       (``episodes_skipped_dedup > 0``). The default-mode
+       counterpart to (1): the fetch did happen, but the content
+       was already in the governance log so the dedup gate
+       absorbed it. Idempotent re-run, not a regression.
+    3. **Some episodes were seen and all were rights-rejected**
+       (``episodes_rejected_rights > 0``). The gate is doing
+       exactly its job; an operator-visible reject isn't a crawl
+       regression.
+
+    Note that ``episodes_skipped_incremental`` does not appear in
+    the conjunction below: incrementally-skipped slugs are filtered
+    *before* the fetch by ``BaseCrawler.incremental_sync`` and
+    therefore never increment ``episodes_seen``. Case (1) already
+    covers them. The CLI summary still reports the counter so
+    operators can distinguish "nothing to do" from "fetched and
+    deduped", but it's redundant in the exit-code calculation.
+
+    The remaining shape — ``episodes_seen > 0`` with no admit, no
+    reject, and no dedup — is the signal of a real regression
+    (e.g. every source's HTML changed shape and parses to empty),
+    and we return 1.
     """
     if (
         totals.episodes_seen > 0
         and totals.episodes_admitted == 0
         and totals.episodes_rejected_rights == 0
         and totals.episodes_skipped_dedup == 0
-        and totals.episodes_skipped_incremental == 0
     ):
         return 1
     return 0
