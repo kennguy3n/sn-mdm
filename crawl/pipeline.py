@@ -417,11 +417,31 @@ class Pipeline:
                 if isinstance(ch, str) and ch:
                     self._seen_content_hashes.add(ch)
                 ep_id = rec.get("episode_id")
-                if isinstance(ep_id, str) and ep_id:
-                    for pid, prefix in prefixes:
-                        if ep_id.startswith(prefix):
-                            self._known_ids_by_publisher[pid].add(ep_id)
-                            break
+                if not isinstance(ep_id, str) or not ep_id:
+                    continue
+                # Prefer the explicit ``publisher_id`` field if
+                # present (entries written by
+                # ``emit_governance_entry`` post the round-3
+                # review). Fall back to prefix matching for
+                # legacy entries that don't carry the field.
+                # Reading the field directly removes the
+                # prefix-collision ambiguity in the
+                # ``{publisher_id}_{series_id}_{slug}`` format
+                # (e.g. a future ``foo_bar`` publisher whose
+                # prefix would otherwise overlap an existing
+                # ``foo``/``bar`` pair), which prefix matching
+                # alone cannot disambiguate.
+                explicit_pid = rec.get("publisher_id")
+                if (
+                    isinstance(explicit_pid, str)
+                    and explicit_pid in self._known_ids_by_publisher
+                ):
+                    self._known_ids_by_publisher[explicit_pid].add(ep_id)
+                    continue
+                for pid, prefix in prefixes:
+                    if ep_id.startswith(prefix):
+                        self._known_ids_by_publisher[pid].add(ep_id)
+                        break
 
 
 # ------------------------------------------------------------------

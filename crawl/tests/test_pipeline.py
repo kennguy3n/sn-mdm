@@ -667,10 +667,13 @@ def test_pipeline_incremental_mode_no_governance_log_runs_full_walk(
 def test_pipeline_load_known_episode_ids_groups_by_publisher_prefix(
     tmp_path: Path,
 ) -> None:
-    """The governance-log reader must partition episode_ids by
-    publisher prefix so each crawler sees only its own admitted
-    set. Deprecated rows must be excluded so a future re-crawl
-    under a different rights code can still admit them.
+    """Legacy entries that don't carry an explicit ``publisher_id``
+    field (written before the round-3 review) must still be
+    partitioned correctly by the prefix-matching fallback. Each
+    crawler must see only its own admitted set, deprecated rows
+    must be excluded so a future re-crawl under a different
+    rights code can still admit them, and a publisher with no
+    config must not bleed into the fake publisher's skip set.
     """
     _register_fake()
     gov = tmp_path / "governance" / "rights_log.jsonl"
@@ -728,6 +731,102 @@ def test_pipeline_load_known_episode_ids_groups_by_publisher_prefix(
     # that removes a publisher while the governance log still has
     # its history.
     assert pipeline._known_ids_for("otherpub") == frozenset()
+
+
+def test_pipeline_load_known_episode_ids_prefers_explicit_publisher_id(
+    tmp_path: Path,
+) -> None:
+    """Governance entries written by the current
+    ``emit_governance_entry`` carry an explicit ``publisher_id``
+    field. ``_load_governance_state`` must prefer that field over
+    the prefix-matching fallback so the loader is robust against
+    the edge case where a future publisher_id collides with an
+    existing ``{publisher_id}_{series_id}`` pair. We construct
+    exactly that collision here: publishers ``foo`` (with
+    series_id ``bar``) and ``foo_bar`` (with series_id
+    ``flagship``) both produce episode_ids that start with
+    ``foo_bar_``. Prefix matching alone would attribute both to
+    ``foo_bar`` (the longer prefix wins); the explicit field
+    routes each row to the right publisher.
+    """
+    from crawl import crawlers
+    from crawl.crawlers.base import BaseCrawler, CrawlerConfig
+
+    class _FooCrawler(BaseCrawler):
+        publisher_id = "foo"
+        series_id = "bar"
+
+        def fetch_transcript(self, slug):  # type: ignore[override]
+            raise NotImplementedError
+
+    class _FooBarCrawler(BaseCrawler):
+        publisher_id = "foo_bar"
+        series_id = "flagship"
+
+        def fetch_transcript(self, slug):  # type: ignore[override]
+            raise NotImplementedError
+
+    crawlers._REGISTRY["foo"] = _FooCrawler  # type: ignore[attr-defined]
+    crawlers._REGISTRY["foo_bar"] = _FooBarCrawler  # type: ignore[attr-defined]
+
+    def _cfg(pid: str, series: str) -> CrawlerConfig:
+        base = _config()
+        return CrawlerConfig(
+            publisher_id=pid,
+            publisher_name=base.publisher_name,
+            base_url=base.base_url,
+            rights_code=base.rights_code,
+            rights_summary=base.rights_summary,
+            country_region=base.country_region,
+            industry_tags=base.industry_tags,
+            function_tags=base.function_tags,
+            business_model_tags=base.business_model_tags,
+            source_type=base.source_type,
+            language=base.language,
+            host=base.host,
+            series_id=series,
+        )
+
+    gov = tmp_path / "governance" / "rights_log.jsonl"
+    gov.parent.mkdir(parents=True, exist_ok=True)
+    gov.write_text(
+        "\n".join(
+            json.dumps(rec)
+            for rec in [
+                # Belongs to ``foo`` (series ``bar``). Prefix
+                # alone would route this to ``foo_bar`` (longer
+                # prefix wins). The explicit publisher_id is the
+                # tiebreaker.
+                {
+                    "publisher_id": "foo",
+                    "episode_id": "foo_bar_collision-1",
+                    "rights_code": "free_access_copyrighted",
+                    "ingestion_date": 1700000000,
+                    "content_hash": "h-foo-1",
+                    "deprecated": False,
+                },
+                # Belongs to ``foo_bar`` (series ``flagship``).
+                {
+                    "publisher_id": "foo_bar",
+                    "episode_id": "foo_bar_flagship_episode-1",
+                    "rights_code": "free_access_copyrighted",
+                    "ingestion_date": 1700000001,
+                    "content_hash": "h-foobar-1",
+                    "deprecated": False,
+                },
+            ]
+        )
+        + "\n"
+    )
+    pipeline = Pipeline(
+        configs={"foo": _cfg("foo", "bar"), "foo_bar": _cfg("foo_bar", "flagship")},
+        packs_root=tmp_path,
+        incremental=True,
+    )
+    assert pipeline._known_ids_for("foo") == frozenset({"foo_bar_collision-1"})
+    assert pipeline._known_ids_for("foo_bar") == frozenset(
+        {"foo_bar_flagship_episode-1"}
+    )
 
 
 def test_pipeline_incremental_skip_count_rolls_into_stats(

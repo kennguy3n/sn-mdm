@@ -865,19 +865,35 @@ class BaseCrawler:
                 exc,
             )
             discovered_slugs = []
-        for source in (seed_slugs, discovered_slugs):
-            for slug in source:
-                if slug in seen:
-                    continue
-                seen.add(slug)
-                slugs.append(slug)
+        # Track the true count of *unique* discovered slugs (i.e.
+        # discovered slugs that weren't already in the seed list)
+        # directly rather than computing it as
+        # ``len(slugs) - len(seed_slugs)`` after the merge. The
+        # arithmetic version was correct only as long as seeds
+        # were inserted first; a future refactor that ever
+        # interleaved seeds and discovery would have silently
+        # produced wrong operator-facing log counts without
+        # raising. Counting at the insertion site makes the
+        # invariant local to one line.
+        for slug in seed_slugs:
+            if slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+        discovered_unique = 0
+        for slug in discovered_slugs:
+            if slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+            discovered_unique += 1
 
         LOG.info(
             "%s: %s — %d seed + %d discovered → %d unique slugs",
             self.publisher_id,
             log_prefix,
             len(seed_slugs),
-            max(0, len(slugs) - len(seed_slugs)),
+            discovered_unique,
             len(slugs),
         )
         return slugs
@@ -1140,10 +1156,24 @@ class BaseCrawler:
         *,
         deprecated: bool = False,
     ) -> dict[str, Any]:
-        """Build the rights-log JSONL line for one episode."""
+        """Build the rights-log JSONL line for one episode.
+
+        ``publisher_id`` is written as an explicit field so the
+        ``Pipeline._load_governance_state`` reader doesn't have to
+        reverse-engineer the publisher from the ``episode_id``
+        string. The episode_id format is
+        ``{publisher_id}_{series_id}_{slug}``, which means a
+        prefix-matching parse is ambiguous in the edge case where
+        a future publisher_id (``foo_bar``) collides with an
+        existing ``{publisher_id}_{series_id}`` pair (``foo_bar``).
+        The explicit field is the source of truth; the loader
+        falls back to prefix matching for legacy entries written
+        before this field existed.
+        """
         raw = normalised.raw
         episode_id = self.episode_id_for_slug(raw.episode_slug)
         return {
+            "publisher_id": self.config.publisher_id,
             "episode_id": episode_id,
             "rights_code": raw.rights_code or self.config.rights_code,
             "ingestion_date": int(time.time()),
