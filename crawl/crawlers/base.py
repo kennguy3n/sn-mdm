@@ -814,6 +814,29 @@ class BaseCrawler:
         exceptions — the guard sits at the merge site so the
         invariant holds for every subclass, current and future.
         """
+        slugs = self._enumerate_slugs(log_prefix="initial_sync")
+        for slug in slugs:
+            try:
+                yield self.fetch_transcript(slug)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("fetch_transcript(%s) failed: %s", slug, exc)
+                continue
+
+    def _enumerate_slugs(self, *, log_prefix: str = "sync") -> list[str]:
+        """Merge seed + discovery slugs into a unique first-seen list.
+
+        Extracted so :meth:`initial_sync` and :meth:`incremental_sync`
+        share exactly one enumeration path — the seed-dedup,
+        discovery-failure-isolation, and log-line arithmetic
+        invariants are pinned by a single set of regression tests
+        in ``crawl/tests/test_pipeline.py`` and don't drift between
+        the two sync flavours.
+
+        ``log_prefix`` distinguishes the two callers in operator
+        logs (``initial_sync — 5 seed + 0 discovered → 5 unique``
+        vs. ``incremental_sync — 5 seed + 0 discovered → 5 unique``)
+        so the same machinery can be observed in either mode.
+        """
         seen: set[str] = set()
         slugs: list[str] = []
         # Compute the *unique* seed count first so the discovered
@@ -842,27 +865,50 @@ class BaseCrawler:
                 exc,
             )
             discovered_slugs = []
-        for source in (seed_slugs, discovered_slugs):
-            for slug in source:
-                if slug in seen:
-                    continue
-                seen.add(slug)
-                slugs.append(slug)
+        # Track the true count of *unique* discovered slugs (i.e.
+        # discovered slugs that weren't already in the seed list)
+        # directly rather than computing it as
+        # ``len(slugs) - len(seed_slugs)`` after the merge. The
+        # arithmetic version was correct only as long as seeds
+        # were inserted first; a future refactor that ever
+        # interleaved seeds and discovery would have silently
+        # produced wrong operator-facing log counts without
+        # raising. Counting at the insertion site makes the
+        # invariant local to one line.
+        for slug in seed_slugs:
+            if slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+        discovered_unique = 0
+        for slug in discovered_slugs:
+            if slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+            discovered_unique += 1
 
         LOG.info(
-            "%s: initial_sync — %d seed + %d discovered → %d unique slugs",
+            "%s: %s — %d seed + %d discovered → %d unique slugs",
             self.publisher_id,
+            log_prefix,
             len(seed_slugs),
-            max(0, len(slugs) - len(seed_slugs)),
+            discovered_unique,
             len(slugs),
         )
+        return slugs
 
-        for slug in slugs:
-            try:
-                yield self.fetch_transcript(slug)
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning("fetch_transcript(%s) failed: %s", slug, exc)
-                continue
+    def episode_id_for_slug(self, episode_slug: str) -> str:
+        """Return the canonical ``episode_id`` for ``episode_slug``.
+
+        The episode_id is the wire-stable identifier that flows
+        through the metadata JSONL, chunks JSONL, governance log,
+        and (after ingest) the Rust pack's ``episode`` table. Its
+        construction lives in one place so a future series-id
+        change or slug-sanitisation rule can't drift between the
+        emit_* helpers and the incremental-sync skip predicate.
+        """
+        return f"{self.config.publisher_id}_{self.config.series_id}_{episode_slug}"
 
     def _discover_episode_slugs(self) -> list[str]:
         """Return slugs discovered by walking the source's index
@@ -882,13 +928,105 @@ class BaseCrawler:
         """
         return []
 
-    def incremental_sync(self, cursor: str | None = None) -> Iterator[RawEpisode]:
-        """Steady-state pull. Default implementation re-runs the
-        full initial_sync; concrete crawlers MAY override to short-
-        circuit on the cursor.
+    def incremental_sync(
+        self,
+        known_episode_ids: frozenset[str] | None = None,
+    ) -> Iterator[RawEpisode]:
+        """Steady-state pull — fetch only slugs whose canonical
+        ``episode_id`` is not already present in
+        ``known_episode_ids``.
+
+        ``known_episode_ids`` is the set of episode_ids the
+        pipeline has decided we should NOT re-fetch on this run.
+        The crawler treats the set as opaque — the policy that
+        produced it lives in :class:`crawl.pipeline.Pipeline`
+        (see :meth:`crawl.pipeline.Pipeline._load_governance_state`
+        and :meth:`crawl.pipeline.Pipeline._known_ids_for` for the
+        composition rules). Concretely, the set contains every
+        episode currently in the pack (so re-fetching would just
+        round-trip the same content) AND every previously-rejected
+        episode whose ``rights_code`` is still outside the active
+        rights allowlist (so re-fetching would just re-reject and
+        append another deprecated governance row). It does *not*
+        contain previously-rejected episodes whose ``rights_code``
+        is now in the allowlist — those need to be re-fetched so
+        the rights gate can re-admit under the new policy.
+
+        Passing ``None`` or an empty set falls back to a full
+        :meth:`initial_sync` walk so a fresh ``packs/`` tree or a
+        crawler that has not been run yet still produces the
+        complete output. This is the safer default and matches
+        the documented contract that incremental mode is additive
+        over initial_sync, never narrower.
+
+        The skip predicate runs *before* the transcript fetch, so
+        the saving over initial_sync is one HTTP request per
+        already-known episode (the index walk still happens — it
+        is one fetch per publisher regardless of episode count and
+        is what enables discovery of new episodes in the first
+        place).
+
+        After the iterator is exhausted, ``self.last_incremental_skip_count``
+        holds the number of slugs that were skipped on this run.
+        The pipeline reads this so :class:`PublisherStats` can
+        report ``episodes_skipped_incremental`` alongside the
+        rights-gate and dedup short-circuit counters.
+
+        Override pattern: this base implementation enumerates
+        slugs via :meth:`_enumerate_slugs`, which composes
+        ``config.episodes`` (seeds) and :meth:`_discover_episode_slugs`
+        (the conventional discovery extension point). Every
+        production crawler today follows that pattern, so the
+        base ``incremental_sync`` works for all of them without
+        modification. If a future crawler overrides
+        :meth:`initial_sync` directly (e.g. to drive enumeration
+        from an API that doesn't fit the slug abstraction), it
+        MUST also override :meth:`incremental_sync` so the
+        cursor-aware skip still fires — otherwise the override
+        crawler would silently fall through to the base, which
+        only knows about the standard ``_discover_episode_slugs``
+        path and would mis-enumerate the catalogue.
         """
-        _ = cursor  # base class ignores; concrete crawlers may use.
-        yield from self.initial_sync()
+        known = frozenset(known_episode_ids or ())
+        self.last_incremental_skip_count = 0
+        if not known:
+            # Empty cursor — fall through to the full walk. This is
+            # the bootstrap case (no governance log yet) and is
+            # documented as the safe default.
+            yield from self.initial_sync()
+            return
+
+        slugs = self._enumerate_slugs(log_prefix="incremental_sync")
+        skipped = 0
+        attempted = 0
+        errors = 0
+        for slug in slugs:
+            if self.episode_id_for_slug(slug) in known:
+                skipped += 1
+                continue
+            attempted += 1
+            try:
+                yield self.fetch_transcript(slug)
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                LOG.warning("fetch_transcript(%s) failed: %s", slug, exc)
+                continue
+        self.last_incremental_skip_count = skipped
+        # ``attempted`` is the count that reached ``fetch_transcript``;
+        # ``errors`` is the subset of those that raised. The arithmetic
+        # ``attempted - errors`` is the count that actually yielded a
+        # ``RawEpisode`` to the pipeline. We log all three so an
+        # operator reading the noise can distinguish "skipped by
+        # cursor" from "tried but blew up" from "successfully fetched"
+        # rather than conflating the latter two under a single
+        # "candidates fetched" tag.
+        LOG.info(
+            "%s: incremental_sync — %d known skipped, %d attempted, %d failed",
+            self.publisher_id,
+            skipped,
+            attempted,
+            errors,
+        )
 
     def fetch_transcript(self, episode_slug: str) -> RawEpisode:
         """Fetch and minimally-parse one episode's raw HTML / PDF.
@@ -976,7 +1114,7 @@ class BaseCrawler:
     def emit_episode(self, normalised: NormalisedEpisode) -> dict[str, Any]:
         """Build the JSONL line for one episode."""
         raw = normalised.raw
-        episode_id = f"{self.config.publisher_id}_{self.config.series_id}_{raw.episode_slug}"
+        episode_id = self.episode_id_for_slug(raw.episode_slug)
         return {
             "episode_id": episode_id,
             "publisher": self.config.publisher_id,
@@ -1007,7 +1145,7 @@ class BaseCrawler:
     ) -> Iterator[dict[str, Any]]:
         """Build the JSONL lines for one episode's chunks."""
         raw = normalised.raw
-        episode_id = f"{self.config.publisher_id}_{self.config.series_id}_{raw.episode_slug}"
+        episode_id = self.episode_id_for_slug(raw.episode_slug)
         for c in chunks:
             anchor = raw.primary_url
             if c.section_heading:
@@ -1027,10 +1165,24 @@ class BaseCrawler:
         *,
         deprecated: bool = False,
     ) -> dict[str, Any]:
-        """Build the rights-log JSONL line for one episode."""
+        """Build the rights-log JSONL line for one episode.
+
+        ``publisher_id`` is written as an explicit field so the
+        ``Pipeline._load_governance_state`` reader doesn't have to
+        reverse-engineer the publisher from the ``episode_id``
+        string. The episode_id format is
+        ``{publisher_id}_{series_id}_{slug}``, which means a
+        prefix-matching parse is ambiguous in the edge case where
+        a future publisher_id (``foo_bar``) collides with an
+        existing ``{publisher_id}_{series_id}`` pair (``foo_bar``).
+        The explicit field is the source of truth; the loader
+        falls back to prefix matching for legacy entries written
+        before this field existed.
+        """
         raw = normalised.raw
-        episode_id = f"{self.config.publisher_id}_{self.config.series_id}_{raw.episode_slug}"
+        episode_id = self.episode_id_for_slug(raw.episode_slug)
         return {
+            "publisher_id": self.config.publisher_id,
             "episode_id": episode_id,
             "rights_code": raw.rights_code or self.config.rights_code,
             "ingestion_date": int(time.time()),

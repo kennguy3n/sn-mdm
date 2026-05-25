@@ -78,6 +78,13 @@ class PublisherStats:
     episodes_admitted: int = 0
     episodes_rejected_rights: int = 0
     episodes_skipped_dedup: int = 0
+    episodes_skipped_incremental: int = 0
+    """Slugs short-circuited before the HTTP fetch because their
+    canonical ``episode_id`` was already in the governance log.
+    Only non-zero when the pipeline was constructed with
+    ``incremental=True``. Distinct from
+    :attr:`episodes_skipped_dedup` (which fires *after* the
+    transcript fetch, on a ``content_hash`` collision)."""
     chunks_emitted: int = 0
 
 
@@ -94,6 +101,7 @@ class PipelineReport:
             out.episodes_admitted += s.episodes_admitted
             out.episodes_rejected_rights += s.episodes_rejected_rights
             out.episodes_skipped_dedup += s.episodes_skipped_dedup
+            out.episodes_skipped_incremental += s.episodes_skipped_incremental
             out.chunks_emitted += s.chunks_emitted
         return out
 
@@ -110,14 +118,42 @@ class Pipeline:
         configs: dict[str, CrawlerConfig],
         packs_root: Path,
         rights_allowlist: tuple[str, ...] = DEFAULT_RIGHTS_ALLOWLIST,
+        *,
+        incremental: bool = False,
     ) -> None:
         self.configs = configs
         self.packs_root = Path(packs_root)
         self.rights_allowlist = {code.lower() for code in rights_allowlist}
+        # ``incremental`` toggles between two episode-iteration
+        # strategies on the crawler side. In the default mode the
+        # pipeline calls :meth:`BaseCrawler.initial_sync` which
+        # fetches every discovered + seeded slug; the content-hash
+        # gate then short-circuits already-known episodes *after*
+        # the HTTP fetch. In incremental mode the pipeline calls
+        # :meth:`BaseCrawler.incremental_sync` with the set of
+        # known ``episode_id``s for that publisher (computed from
+        # the governance log), so the crawler can skip the fetch
+        # entirely. The two modes are equivalent in output
+        # (steady-state runs produce the same JSONL either way),
+        # but incremental drops the HTTP cost of re-fetching
+        # already-ingested episodes.
+        self.incremental = incremental
         # Map content_hash -> episode_id so re-crawls collapse on
         # already-seen content (third invariant from the research).
         self._seen_content_hashes: set[str] = set()
-        self._load_known_hashes()
+        # Per-publisher set of ``episode_id``s admitted in some
+        # previous run. Populated alongside ``_seen_content_hashes``
+        # in a single pass over the governance log so the file is
+        # never opened twice for the same data. In default-mode
+        # runs the map is still computed (the cost is one extra
+        # ``str.startswith`` per record) so a future call into
+        # ``_known_ids_for`` doesn't have to re-read; this also
+        # keeps the boot-time invariant readable — one method, one
+        # pass.
+        self._known_ids_by_publisher: dict[str, set[str]] = {
+            pid: set() for pid in self.configs
+        }
+        self._load_governance_state()
 
     # -- public surface --------------------------------------------------
 
@@ -139,6 +175,10 @@ class Pipeline:
         crawler_cls = get_crawler(publisher_id)
         crawler = crawler_cls(config=config, packs_root=self.packs_root)
         stats = PublisherStats(publisher_id=publisher_id)
+        # Reset the per-crawler incremental counter so we read the
+        # count produced by *this* run, not a leftover from a prior
+        # incremental_sync() on the same crawler instance.
+        crawler.last_incremental_skip_count = 0
 
         metadata_path = crawler.open_jsonl("metadata")
         chunks_path = crawler.open_jsonl("chunks")
@@ -170,6 +210,24 @@ class Pipeline:
                     self._write_governance(
                         gov_fp, crawler, normalised, deprecated=True
                     )
+                    # Mirror of the boot-time deprecated-row
+                    # treatment in ``_load_governance_state``: the
+                    # episode was just rejected under the *current*
+                    # allowlist, so its episode_id MUST land in the
+                    # in-memory skip set. Without this, a second
+                    # ``run_publisher(publisher_id)`` call within
+                    # the same :class:`Pipeline` lifetime (duplicate
+                    # entry in the ``targets`` list) would re-fetch
+                    # the same persistently-rejected episode, run
+                    # the gate again, and append another deprecated
+                    # governance row — defeating the round-5 fix at
+                    # the in-process boundary. The boot-time and
+                    # in-process invariants must agree: a rejection
+                    # under the active policy is sticky for the
+                    # remainder of the run.
+                    self._known_ids_by_publisher.setdefault(
+                        publisher_id, set()
+                    ).add(crawler.episode_id_for_slug(raw.episode_slug))
                     continue
 
                 # Normalise *first* so the content-hash is available
@@ -186,6 +244,26 @@ class Pipeline:
                 normalised = crawler.normalize(raw)
                 if normalised.content_hash in self._seen_content_hashes:
                     stats.episodes_skipped_dedup += 1
+                    # Mirror of the admit and reject paths: this
+                    # slug *was* fetched (HTTP cost already paid)
+                    # and its normalised content collided with an
+                    # already-seen ``content_hash``. The dedup
+                    # gate suppresses the metadata/chunks/
+                    # governance writes, but if the same publisher
+                    # appears twice in the ``targets`` list within
+                    # one :class:`Pipeline` lifetime, the second
+                    # invocation would otherwise re-fetch the same
+                    # slug, re-normalise to the same hash, and
+                    # re-hit dedup — a wasted HTTP request. Adding
+                    # the episode_id to the in-memory skip set
+                    # short-circuits the second fetch at the
+                    # incremental gate and (incidentally) attributes
+                    # the skip to ``episodes_skipped_incremental``
+                    # instead of ``episodes_skipped_dedup`` in the
+                    # repeat stats.
+                    self._known_ids_by_publisher.setdefault(
+                        publisher_id, set()
+                    ).add(crawler.episode_id_for_slug(raw.episode_slug))
                     continue
                 self._seen_content_hashes.add(normalised.content_hash)
                 crawler.save_raw(raw)
@@ -203,6 +281,27 @@ class Pipeline:
 
                 self._write_governance(gov_fp, crawler, normalised, deprecated=False)
                 stats.episodes_admitted += 1
+                # Keep the in-memory skip set aligned with the
+                # governance log we just appended to so a second
+                # ``run_publisher(publisher_id)`` call within the
+                # same :class:`Pipeline` lifetime (duplicate entry
+                # in the ``targets`` list, or a deliberate two-
+                # pass run) attributes the skip to the incremental
+                # counter rather than the content-hash dedup
+                # counter. Without this update, the content-hash
+                # gate would still suppress the duplicate emission
+                # (output stays correct) but the operator-facing
+                # stats would be misleading.
+                self._known_ids_by_publisher.setdefault(
+                    publisher_id, set()
+                ).add(crawler.episode_id_for_slug(raw.episode_slug))
+        # Read the incremental skip count the crawler accumulated
+        # during this run. In non-incremental mode the counter
+        # stays at 0 (we never call incremental_sync), so this is a
+        # cheap no-op for the default flow.
+        stats.episodes_skipped_incremental = getattr(
+            crawler, "last_incremental_skip_count", 0
+        )
         return stats
 
     # -- internals -------------------------------------------------------
@@ -212,10 +311,67 @@ class Pipeline:
         # deterministic across runs (the crawler's own generators
         # are deterministic but `list(...)` makes the contract
         # obvious in tracebacks).
-        episodes: list[RawEpisode] = []
-        for raw in crawler.initial_sync():
-            episodes.append(raw)
+        if self.incremental:
+            known = self._known_ids_for(crawler.publisher_id)
+            episodes = list(crawler.incremental_sync(known_episode_ids=known))
+        else:
+            episodes = list(crawler.initial_sync())
         return episodes
+
+    def _known_ids_for(self, publisher_id: str) -> frozenset[str]:
+        """Return the set of ``episode_id``s the incremental gate
+        should skip for ``publisher_id``.
+
+        The underlying ``_known_ids_by_publisher`` map is populated
+        once at construction time (single pass over the governance
+        log alongside ``_seen_content_hashes``) and *kept in sync*
+        as the current run processes new episodes — see
+        :meth:`run_publisher`, which adds the episode_id in *all
+        three* terminal paths (admitted, rights-rejected, and
+        content-hash-deduped). This means a second
+        ``run_publisher`` call for the same publisher inside one
+        :class:`Pipeline` lifetime (e.g. duplicate entry in the
+        ``targets`` list) short-circuits at the incremental gate
+        — saving the wasted HTTP fetch — regardless of which gate
+        the first call ended at.
+
+        Skip-set composition rules (cross-reference
+        :meth:`_load_governance_state` for the boot-time source
+        of truth):
+
+        * Non-deprecated rows: always included (the episode is in
+          the pack).
+        * Deprecated rows whose ``rights_code`` is *still* outside
+          the current ``rights_allowlist``: included. The episode
+          was rejected by an active policy, so re-fetching it
+          would only re-reject and append another deprecated row.
+        * Deprecated rows whose ``rights_code`` is now in the
+          current ``rights_allowlist``: NOT included. The
+          allowlist has changed since the rejection, and the
+          incremental gate must let the crawler re-fetch so the
+          rights gate can re-admit under the new policy.
+
+        The content-hash dedup gate has its own (publisher-
+        agnostic) skip set populated only from non-deprecated
+        rows, so a re-admission of a previously-deprecated
+        episode is never silently absorbed by dedup.
+        """
+        # Snapshot semantics: we return ``frozenset`` of the
+        # publisher's current skip set so the caller (typically
+        # ``BaseCrawler.incremental_sync`` via ``_iter_episodes``)
+        # makes its slug-level skip decisions against a stable
+        # value for the duration of the current ``run_publisher``.
+        # The in-process updates at the three terminal sites
+        # (admitted, rejected, deduped) mutate
+        # ``_known_ids_by_publisher`` directly and therefore do
+        # NOT retroactively affect the *current* publisher's
+        # run — they only take effect on a *subsequent*
+        # ``run_publisher`` call for the same publisher (the
+        # duplicate-target scenario). This is by design: re-
+        # snapshotting per-slug would also defeat the
+        # iter-as-list contract that ``_iter_episodes`` depends
+        # on for deterministic tracebacks.
+        return frozenset(self._known_ids_by_publisher.get(publisher_id, ()))
 
     def _rights_gate_allows(self, rights_code: str) -> bool:
         return rights_code.lower() in self.rights_allowlist
@@ -251,10 +407,87 @@ class Pipeline:
         fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
         fp.flush()
 
-    def _load_known_hashes(self) -> None:
+    def _load_governance_state(self) -> None:
+        """Walk the governance log exactly once and populate both
+        ``_seen_content_hashes`` and ``_known_ids_by_publisher``.
+
+        The governance log is append-only and is the single source
+        of truth for two boot-time facts:
+
+        1. Which ``content_hash`` digests are already represented
+           in the pack (used by the post-fetch dedup gate).
+        2. Which ``episode_id``s have been admitted for each
+           publisher (used by the pre-fetch incremental skip).
+
+        Reading the file once and populating both maps in the same
+        loop is strictly cheaper than two passes — the dominant
+        cost is the JSON parse, which we'd otherwise pay twice per
+        record — and keeps the boot-time semantics of the two
+        gates colocated.
+
+        Latest-wins note: the log is documented as effectively
+        append-once per ``episode_id`` (the two upstream gates,
+        content-hash dedup in default mode and incremental skip in
+        ``--incremental`` mode, both prevent a second entry for an
+        already-admitted episode from being written). If a future
+        change ever permits a non-deprecated row followed by a
+        deprecated row for the same episode_id, the deprecated row
+        would NOT remove the earlier ``episode_id`` from the skip
+        set here, and the incremental gate would continue to
+        skip it. That contract is intentional today (a rejection
+        happening *after* an admission is a curation decision the
+        operator made deliberately, and we should not silently
+        force a re-fetch of the same content), but a future
+        latest-wins semantics would need to track the *last* row
+        per episode_id rather than the *first* match.
+
+        Deprecated-row gating: a deprecated row records that the
+        episode was *fetched and then rejected* by the rights gate
+        under a particular ``rights_code``. We add that episode_id
+        to the incremental skip set IFF the recorded ``rights_code``
+        is still outside the current ``rights_allowlist``. This
+        avoids the steady-state failure mode where every
+        ``--incremental`` run re-fetches every persistently-
+        rejected episode and appends another deprecated row,
+        producing unbounded log growth and pointless HTTP cost
+        proportional to the number of rejected episodes. If the
+        operator later extends the allowlist to include the
+        recorded code, the ``still_rejected`` check flips to
+        ``False`` and the id falls out of the skip set on the next
+        boot, allowing the re-fetch + re-admission. The
+        ``content_hash`` is never carried forward for deprecated
+        rows, so the dedup gate never suppresses that legitimate
+        re-admission.
+        """
         gov = self.packs_root / "governance" / "rights_log.jsonl"
         if not gov.exists():
             return
+        # Pre-build a list of ``(publisher_id, prefix)`` pairs
+        # sorted by descending prefix length so a longer prefix
+        # (e.g. ``acquired_long_form_``) wins over a shorter one
+        # (e.g. ``acquired_``) on partition. Today no two
+        # registered publishers share a prefix, so the order
+        # doesn't matter; the sort is defence-in-depth for future
+        # additions.
+        #
+        # Orphaned-prefix note: if a publisher previously wrote
+        # governance entries and is later *removed* from
+        # ``self.configs``, its ``episode_id``s are silently
+        # dropped here (no prefix matches, no break, the loop
+        # falls off the end). That's the right behaviour for the
+        # incremental gate — a publisher that no longer exists in
+        # the registry has no crawler to skip slugs for, so
+        # forwarding its ids would just inflate the in-memory
+        # map for nothing. The orphaned content_hash entries
+        # above are still loaded into ``_seen_content_hashes``
+        # because that gate is publisher-agnostic: a
+        # re-introduction of the same content via a different
+        # publisher should still dedup.
+        prefixes = sorted(
+            ((pid, f"{pid}_") for pid in self.configs),
+            key=lambda kv: len(kv[1]),
+            reverse=True,
+        )
         with gov.open("r", encoding="utf-8") as fp:
             for line in fp:
                 line = line.strip()
@@ -264,11 +497,72 @@ class Pipeline:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                ch = rec.get("content_hash")
-                # Don't carry rejection hashes forward — a re-crawl
-                # could later succeed under a different rights code.
-                if isinstance(ch, str) and ch and not rec.get("deprecated"):
-                    self._seen_content_hashes.add(ch)
+                ep_id = rec.get("episode_id")
+                ep_id_valid = isinstance(ep_id, str) and bool(ep_id)
+                is_deprecated = bool(rec.get("deprecated"))
+                if is_deprecated:
+                    # A previously-rejected episode. We never carry
+                    # the ``content_hash`` forward (a re-crawl might
+                    # legitimately encounter different content), but
+                    # we *do* want to add the ``episode_id`` to the
+                    # incremental skip set IF the rights_code that
+                    # caused the rejection is still outside the
+                    # current allowlist. Otherwise every
+                    # ``--incremental`` run would re-fetch the
+                    # known-rejected slug, re-evaluate the rights
+                    # gate against the same code, and append yet
+                    # another deprecated row — producing unbounded
+                    # governance-log growth and pointless HTTP cost
+                    # for persistently-rejected episodes.
+                    #
+                    # If the operator later extends
+                    # ``rights_allowlist`` to include the rejected
+                    # code, that change is what makes the entry
+                    # eligible for re-admission: the
+                    # ``still_rejected`` check below flips to
+                    # ``False`` on the next boot, the id is no
+                    # longer added to the skip set, and the
+                    # incremental crawl picks up the episode again
+                    # and emits a fresh non-deprecated governance
+                    # entry. The dedup gate has the recorded
+                    # ``content_hash`` (we never loaded it), so the
+                    # re-admit is not suppressed.
+                    rejected_code = rec.get("rights_code")
+                    still_rejected = (
+                        isinstance(rejected_code, str)
+                        and rejected_code.lower() not in self.rights_allowlist
+                    )
+                    if not (still_rejected and ep_id_valid):
+                        continue
+                else:
+                    ch = rec.get("content_hash")
+                    if isinstance(ch, str) and ch:
+                        self._seen_content_hashes.add(ch)
+                    if not ep_id_valid:
+                        continue
+                # Prefer the explicit ``publisher_id`` field if
+                # present (entries written by
+                # ``emit_governance_entry`` post the round-3
+                # review). Fall back to prefix matching for
+                # legacy entries that don't carry the field.
+                # Reading the field directly removes the
+                # prefix-collision ambiguity in the
+                # ``{publisher_id}_{series_id}_{slug}`` format
+                # (e.g. a future ``foo_bar`` publisher whose
+                # prefix would otherwise overlap an existing
+                # ``foo``/``bar`` pair), which prefix matching
+                # alone cannot disambiguate.
+                explicit_pid = rec.get("publisher_id")
+                if (
+                    isinstance(explicit_pid, str)
+                    and explicit_pid in self._known_ids_by_publisher
+                ):
+                    self._known_ids_by_publisher[explicit_pid].add(ep_id)
+                    continue
+                for pid, prefix in prefixes:
+                    if ep_id.startswith(prefix):
+                        self._known_ids_by_publisher[pid].add(ep_id)
+                        break
 
 
 # ------------------------------------------------------------------
@@ -358,19 +652,42 @@ def main(argv: list[str] | None = None) -> int:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help=(
+            "Steady-state mode. Skip slugs whose canonical episode_id is "
+            "already known from the governance log, BEFORE the transcript "
+            "fetch. 'Known' means either (a) previously admitted (the pack "
+            "already has it) or (b) previously rejected by the rights gate "
+            "AND the recorded rights_code is still outside the current "
+            "rights_allowlist (re-fetching would only re-reject and append "
+            "another deprecated row). Episodes whose rights_code is now in "
+            "the allowlist (operator extended the allowlist between runs) "
+            "are NOT skipped, so the new policy can take effect. Default "
+            "mode runs the full discovery + transcript fetch loop and "
+            "relies on the content_hash gate to skip duplicates AFTER the "
+            "HTTP fetch."
+        ),
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     configs = load_config(args.config)
-    pipeline = Pipeline(configs=configs, packs_root=args.packs_root)
+    pipeline = Pipeline(
+        configs=configs,
+        packs_root=args.packs_root,
+        incremental=args.incremental,
+    )
     report = pipeline.run(args.publishers or None)
     totals = report.totals()
     LOG.info(
-        "pipeline complete: %d seen, %d admitted, %d rejected, %d deduped, %d chunks",
+        "pipeline complete: %d seen, %d admitted, %d rejected, %d deduped, %d incremental-skipped, %d chunks",
         totals.episodes_seen,
         totals.episodes_admitted,
         totals.episodes_rejected_rights,
         totals.episodes_skipped_dedup,
+        totals.episodes_skipped_incremental,
         totals.chunks_emitted,
     )
     return exit_code_for(totals)
@@ -380,17 +697,41 @@ def exit_code_for(totals: PublisherStats) -> int:
     """Decide the CLI exit code from an aggregate :class:`PublisherStats`.
 
     Non-zero only when every publisher failed to admit anything *and*
-    the failure can't be explained by either the rights gate or the
-    content-hash dedup short-circuit. The pipeline is documented as
-    idempotent — re-running on a packs root that already contains
-    every episode will (correctly) admit nothing because every
-    episode hashes to a ``content_hash`` that's already in the
-    governance log, and the run should succeed. Likewise a run that
-    only saw rights-rejected episodes is doing exactly what the gate
-    asked of it. Only return non-zero when *all three* explanations
-    are absent — that's the signal of a real crawl regression (e.g.
-    every source's HTML changed shape and parses to empty), not
-    normal steady-state.
+    the failure can't be explained by any of the documented
+    short-circuits. The pipeline is documented as idempotent —
+    re-running on a packs root that already contains every episode
+    will (correctly) admit nothing. There are three legitimate
+    "no admits" paths, and each one is observable in the totals:
+
+    1. **No episodes reached the pipeline at all** (``episodes_seen
+       == 0``). This is the steady-state ``--incremental`` case —
+       the crawler short-circuits known slugs *before* the fetch,
+       so they never become "seen". It's also what you get from a
+       publisher whose discovery returns empty for legitimate
+       reasons. Either way, zero-seen is not a regression and we
+       return 0.
+    2. **Some episodes were seen and all were content-hash-deduped**
+       (``episodes_skipped_dedup > 0``). The default-mode
+       counterpart to (1): the fetch did happen, but the content
+       was already in the governance log so the dedup gate
+       absorbed it. Idempotent re-run, not a regression.
+    3. **Some episodes were seen and all were rights-rejected**
+       (``episodes_rejected_rights > 0``). The gate is doing
+       exactly its job; an operator-visible reject isn't a crawl
+       regression.
+
+    Note that ``episodes_skipped_incremental`` does not appear in
+    the conjunction below: incrementally-skipped slugs are filtered
+    *before* the fetch by ``BaseCrawler.incremental_sync`` and
+    therefore never increment ``episodes_seen``. Case (1) already
+    covers them. The CLI summary still reports the counter so
+    operators can distinguish "nothing to do" from "fetched and
+    deduped", but it's redundant in the exit-code calculation.
+
+    The remaining shape — ``episodes_seen > 0`` with no admit, no
+    reject, and no dedup — is the signal of a real regression
+    (e.g. every source's HTML changed shape and parses to empty),
+    and we return 1.
     """
     if (
         totals.episodes_seen > 0
