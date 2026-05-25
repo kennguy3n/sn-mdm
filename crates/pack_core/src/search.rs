@@ -147,6 +147,13 @@ pub struct SearchHit {
     pub bm25_score: Option<f64>,
     pub semantic_score: Option<f64>,
     pub tag_match: bool,
+    /// ``chunk.created_at`` (Unix epoch seconds) for the matched
+    /// row. Used as a deterministic secondary sort key after
+    /// ``rank_score``, so equally-ranked hits (the common case for
+    /// pure tag-only queries where every survivor accrues the same
+    /// ``tag_boost``) come back in newest-first order rather than
+    /// in `HashMap` iteration order.
+    pub created_at: i64,
 }
 
 /// Search engine attached to a [`PackStore`]. Stateless — every
@@ -185,6 +192,7 @@ impl<'a> SearchEngine<'a> {
                 r#"SELECT
                        c.chunk_id, c.episode_id, c.chunk_text,
                        c.citation_anchor, c.section_heading,
+                       c.created_at,
                        bm25(chunk_fts) AS bm
                    FROM chunk_fts
                    JOIN chunk c ON c.chunk_id = chunk_fts.chunk_id
@@ -199,11 +207,12 @@ impl<'a> SearchEngine<'a> {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, Option<String>>(4)?,
-                    r.get::<_, f64>(5)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, f64>(6)?,
                 ))
             })?;
             for row in rows {
-                let (chunk_id, episode_id, chunk_text, citation, section, bm) = row?;
+                let (chunk_id, episode_id, chunk_text, citation, section, created_at, bm) = row?;
                 // SQLite's `bm25()` returns lower-is-better; flip
                 // the sign so callers see higher-is-better
                 // consistently across lanes.
@@ -221,6 +230,7 @@ impl<'a> SearchEngine<'a> {
                     bm25_score: None,
                     semantic_score: None,
                     tag_match: matching_episodes.contains(&episode_id),
+                    created_at,
                 });
                 entry.bm25_score = Some(bm_score);
                 entry.rank_score += weights.bm25 * bm_score;
@@ -239,7 +249,7 @@ impl<'a> SearchEngine<'a> {
                 .join(",");
             let sql = format!(
                 r#"SELECT c.chunk_id, c.episode_id, c.chunk_text,
-                          c.citation_anchor, c.section_heading
+                          c.citation_anchor, c.section_heading, c.created_at
                    FROM chunk c
                    WHERE c.episode_id IN ({placeholders})
                    ORDER BY c.created_at DESC
@@ -255,10 +265,11 @@ impl<'a> SearchEngine<'a> {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             })?;
             for row in rows {
-                let (chunk_id, episode_id, chunk_text, citation, section) = row?;
+                let (chunk_id, episode_id, chunk_text, citation, section, created_at) = row?;
                 let entry = merged.entry(chunk_id.clone()).or_insert_with(|| SearchHit {
                     chunk_id: chunk_id.clone(),
                     episode_id: episode_id.clone(),
@@ -269,6 +280,7 @@ impl<'a> SearchEngine<'a> {
                     bm25_score: None,
                     semantic_score: None,
                     tag_match: true,
+                    created_at,
                 });
                 entry.tag_match = true;
             }
@@ -283,7 +295,7 @@ impl<'a> SearchEngine<'a> {
                 let mut stmt = self.store.connection().prepare(
                     r#"SELECT e.chunk_id, c.episode_id, c.chunk_text,
                               c.citation_anchor, c.section_heading,
-                              e.embedding
+                              c.created_at, e.embedding
                        FROM chunk_embeddings e
                        JOIN chunk c ON c.chunk_id = e.chunk_id
                        WHERE e.model_tag = ?"#,
@@ -295,11 +307,13 @@ impl<'a> SearchEngine<'a> {
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, Option<String>>(4)?,
-                        r.get::<_, Vec<u8>>(5)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, Vec<u8>>(6)?,
                     ))
                 })?;
                 for row in rows {
-                    let (chunk_id, episode_id, chunk_text, citation, section, vec_blob) = row?;
+                    let (chunk_id, episode_id, chunk_text, citation, section, created_at, vec_blob) =
+                        row?;
                     if tags_active && !matching_episodes.contains(&episode_id) {
                         continue;
                     }
@@ -320,6 +334,7 @@ impl<'a> SearchEngine<'a> {
                         bm25_score: None,
                         semantic_score: None,
                         tag_match: matching_episodes.contains(&episode_id),
+                        created_at,
                     });
                     entry.semantic_score = Some(sim);
                     entry.rank_score += weights.semantic * sim;
@@ -337,11 +352,25 @@ impl<'a> SearchEngine<'a> {
         }
 
         // ---- Merge + sort ------------------------------------------
+        // Primary key: ``rank_score`` (higher is better).
+        // Secondary key: ``created_at`` (newer is better). The
+        // ``HashMap`` above loses insertion order, so equally-
+        // ranked hits (the common case for pure tag-only queries
+        // where every survivor accrues the same ``tag_boost``)
+        // would otherwise come back in iteration order. The
+        // secondary key restores the SQL-side recency intent
+        // documented for the tag-only lane and, for the BM25 and
+        // semantic lanes, gives ties a deterministic newest-first
+        // order across runs.
+        // Tertiary key: ``chunk_id`` so two chunks created in the
+        // same second still sort deterministically.
         let mut hits: Vec<SearchHit> = merged.into_values().collect();
         hits.sort_by(|a, b| {
             b.rank_score
                 .partial_cmp(&a.rank_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
         });
         hits.truncate(limit);
         Ok(hits)
@@ -575,8 +604,52 @@ mod tests {
 
     #[test]
     fn tag_only_query_returns_chunks_ordered_by_recency() {
+        // Regression: the tag-only lane SQL `ORDER BY c.created_at
+        // DESC` was being discarded by the downstream `HashMap`
+        // merge step, so equally-ranked hits (every tag-only
+        // survivor accrues the same ``tag_boost``) came back in
+        // iteration order. The fix carries ``created_at`` on
+        // ``SearchHit`` and uses it as the secondary sort key.
+        //
+        // To exercise the *ordering* (not just the count), this test
+        // seeds three chunks with *deliberately distinct*
+        // ``created_at`` values. ``ingest_chunk`` stamps
+        // ``Utc::now()`` which collapses to the same second across
+        // a fast test run, so we directly update the rows after
+        // ingest — the chunk PK is still authoritative for
+        // identity, and the test only inspects the search ordering.
         let store = PackStore::open_in_memory().unwrap();
         seed(&store);
+        // Override ``created_at`` so the three chunks are stamped
+        // ``1000``, ``2000``, ``3000`` — a 1000-second-apart
+        // ladder so the tag-only lane has a real recency signal to
+        // honour. We expect descending order: #0002, #0001, #0000.
+        let pairs = [
+            ("acquired_flagship_costco#0000", 1000_i64),
+            ("acquired_flagship_costco#0001", 2000_i64),
+            ("acquired_flagship_costco#0002", 3000_i64),
+        ];
+        for (chunk_id, ts) in pairs.iter() {
+            // The schema's append-only trigger rejects UPDATE on
+            // ``chunk``. Drop the trigger for the duration of this
+            // test only — every other test path still goes
+            // through ``ingest_chunk``, which is the production
+            // contract.
+            store
+                .connection()
+                .execute_batch(
+                    "DROP TRIGGER IF EXISTS chunk_no_update;\nDROP TRIGGER IF EXISTS chunk_no_delete;",
+                )
+                .unwrap();
+            store
+                .connection()
+                .execute(
+                    "UPDATE chunk SET created_at = ? WHERE chunk_id = ?",
+                    params![ts, chunk_id],
+                )
+                .unwrap();
+        }
+
         let engine = SearchEngine::new(&store);
         let hits = engine
             .search(&SearchQuery {
@@ -590,9 +663,21 @@ mod tests {
             })
             .unwrap();
         assert_eq!(hits.len(), 3);
+        // Newest first — the secondary sort key on
+        // ``created_at`` must restore the SQL-side ordering that the
+        // ``HashMap`` merge erases.
+        assert_eq!(hits[0].chunk_id, "acquired_flagship_costco#0002");
+        assert_eq!(hits[1].chunk_id, "acquired_flagship_costco#0001");
+        assert_eq!(hits[2].chunk_id, "acquired_flagship_costco#0000");
         for h in &hits {
             assert!(h.tag_match);
         }
+        // Every tag-only hit must carry its real ``created_at`` —
+        // not the default `0` — so downstream consumers can use
+        // the field for further ranking / display.
+        assert_eq!(hits[0].created_at, 3000);
+        assert_eq!(hits[1].created_at, 2000);
+        assert_eq!(hits[2].created_at, 1000);
     }
 
     #[test]

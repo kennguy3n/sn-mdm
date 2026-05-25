@@ -42,11 +42,33 @@ use crate::SCHEMA_VERSION;
 
 /// Default rights-code allowlist applied by [`PackStore::ingest_episode`].
 ///
-/// Codes intentionally omitted from the default allowlist:
+/// The default is permissive enough to admit the sources catalogued
+/// in `docs/SOURCES.md`. Operators with a stricter legal posture
+/// should override via [`PackStore::set_rights_allowlist`] (the
+/// helper consumes any iterator of codes, so a one-line call site
+/// can pin the allowlist to e.g. just `ogl_v3` + `public_domain`).
+///
+/// Codes intentionally **omitted** from the default allowlist:
 ///
 /// * `paywalled` — we never crawl behind a paywall.
 /// * `unknown`   — explicit rejection; the crawler must classify.
-/// * `cc_by_nd`  — no-derivatives includes chunking; rejected by default.
+/// * `cc_by_nd`  — the bare NoDerivatives variant. Rejected because
+///   chunking is itself a derivative work and the licence does not
+///   carry the non-commercial qualifier we rely on for the
+///   educational-fair-use accommodation that admits `cc_by_nc_nd`
+///   (see next bullet).
+///
+/// Codes that admit a deliberate carve-out:
+///
+/// * `cc_by_nc_nd` — *also* carries the ND clause but is admitted
+///   because (1) the NC qualifier restricts use to non-commercial,
+///   educational distribution, which is the on-device pack's only
+///   intended use, and (2) every chunk carries its `citation_anchor`
+///   back to the original page, which preserves the attribution
+///   contract. Operators redistributing the pack for commercial
+///   use **must** override this default and drop `cc_by_nc_nd` from
+///   the allowlist — the carve-out is specific to the
+///   `sn-mdm` operating model and is not a general legal opinion.
 pub const DEFAULT_RIGHTS_ALLOWLIST: &[&str] = &[
     "ogl_v3",
     "cc_by",

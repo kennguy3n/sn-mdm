@@ -345,13 +345,20 @@ def chunk_normalised_text(
             )
         )
         # Carry the trailing overlap tokens forward into the next
-        # buffer. Operate on words because token counts are
-        # approximate.
+        # buffer. We slice on word boundaries (whitespace split) so
+        # the seed text is human-readable, but compute
+        # ``buffer_tokens`` via :func:`count_tokens` — the same
+        # punctuation-aware counter the accumulator uses elsewhere
+        # — so the running token budget does not drift when the
+        # carried tail contains punctuation. Without this the
+        # follow-up chunk could overflow ``target_tokens`` by the
+        # number of punctuation tokens hidden in the overlap.
         words = body.split()
         if overlap_tokens > 0 and len(words) > overlap_tokens:
             tail = words[-overlap_tokens:]
-            buffer = [" ".join(tail)]
-            buffer_tokens = len(tail)
+            seed = " ".join(tail)
+            buffer = [seed]
+            buffer_tokens = count_tokens(seed)
         else:
             buffer = []
             buffer_tokens = 0
@@ -398,8 +405,12 @@ def chunk_normalised_text(
                     break
             if overlap_tokens > 0 and len(last_window_words) > overlap_tokens:
                 tail = last_window_words[-overlap_tokens:]
-                buffer = [" ".join(tail)]
-                buffer_tokens = len(tail)
+                seed = " ".join(tail)
+                buffer = [seed]
+                # Same rationale as in ``_flush_chunk``: use the
+                # punctuation-aware counter so the running token
+                # budget tracks reality.
+                buffer_tokens = count_tokens(seed)
             else:
                 buffer = []
                 buffer_tokens = 0
@@ -516,15 +527,44 @@ class BaseCrawler:
         if origin in self._robots_cache:
             return self._robots_cache[origin]
         rp = urllib.robotparser.RobotFileParser()
-        rp.set_url(urllib.parse.urljoin(origin, "/robots.txt"))
+        robots_url = urllib.parse.urljoin(origin, "/robots.txt")
+        rp.set_url(robots_url)
+        # Fetch robots.txt through the crawler's own
+        # :class:`requests.Session` rather than the stdlib
+        # ``RobotFileParser.read()`` (which uses
+        # :func:`urllib.request.urlopen`). Going through the session
+        # gives us three properties the stdlib helper does not:
+        #
+        # 1. the custom ``User-Agent`` header from
+        #    :meth:`_build_session` is sent, so site operators see
+        #    the same identifier on robots.txt requests that they
+        #    see on content requests;
+        # 2. the rate-limiter at :meth:`_respect_rate_limit` is
+        #    honoured — so we cannot fire robots.txt + first
+        #    content request back-to-back faster than the configured
+        #    cadence; and
+        # 3. retries / timeouts inherit the session policy instead
+        #    of falling back to the stdlib defaults.
         try:
-            rp.read()
+            self._respect_rate_limit()
+            resp = self.session.get(robots_url, timeout=30)
+            if resp.status_code >= 400:
+                # Per RFC 9309: 4xx is treated as "no robots.txt",
+                # i.e. crawling is implicitly allowed. 5xx is the
+                # "must defer" case, but the same conservative
+                # outcome (parse([]) → allow everything) applies
+                # — every concrete crawler still passes through
+                # the per-source manual review in
+                # ``docs/SOURCES.md``.
+                rp.parse([])
+            else:
+                # ``RobotFileParser.parse`` expects an *iterable of
+                # lines without trailing newlines*; ``str.splitlines``
+                # gives exactly that and tolerates ``\r\n`` /
+                # ``\n`` / ``\r`` endings.
+                rp.parse(resp.text.splitlines())
         except Exception as exc:  # noqa: BLE001 - log + treat as allow
             LOG.warning("robots.txt fetch failed for %s: %s", origin, exc)
-            # Treat a fetch failure as "allow" since none of the
-            # configured sources block crawlers in their robots.txt.
-            # Concrete crawlers are still bound by per-source manual
-            # review in `docs/SOURCES.md`.
             rp.parse([])
         self._robots_cache[origin] = rp
         return rp
