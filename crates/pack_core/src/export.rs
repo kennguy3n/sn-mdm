@@ -304,9 +304,29 @@ impl PackReader {
     /// / checksum mismatches all surface as their respective
     /// [`PackError`] variants.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        // Minimum framing: magic (5) + version (1) + manifest_len
-        // (8) + db_len (8) = 22 bytes. A pack smaller than that is
-        // structurally invalid.
+        // Minimum framing the up-front check guards:
+        //
+        //   magic (5) + version (1) + manifest_len (8) + db_len (8)
+        //                                              = 22 bytes
+        //
+        // **Note**: a 22-byte buffer guarantees that the magic, the
+        // version byte, and the *first* length header
+        // (``manifest_len``) can be read; ``db_len`` actually lives
+        // at offset ``14 + manifest_len`` (after the variable-length
+        // manifest JSON), so its read is not yet bounds-checked by
+        // this constant. ``db_len`` plus the following blob are
+        // re-validated by :func:`read_u64_field` /
+        // :func:`read_slice`, which return
+        // :variant:`PackError::TruncatedPack` with explicit
+        // ``offset`` / ``needed`` / ``available`` diagnostics when
+        // the buffer is too short.
+        //
+        // The 22-byte constant is therefore a fast structural reject
+        // for obviously-invalid inputs (empty buffers, magic-only
+        // buffers, partial framing) so the variable-length reads
+        // never run against a buffer that's structurally too small
+        // to even hold the fixed prefix. Defence in depth: every
+        // variable-length read still re-checks its own bounds.
         const MIN_HEADER_BYTES: usize = PACK_MAGIC.len() + 1 + 8 + 8;
         if bytes.len() < MIN_HEADER_BYTES {
             return Err(PackError::TruncatedPack {

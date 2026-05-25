@@ -20,7 +20,6 @@ specific HTML / PDF parsing.
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import logging
 import os
 import re
@@ -33,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import blake3
 import requests
 
 LOG = logging.getLogger(__name__)
@@ -213,18 +213,16 @@ def content_hash(text: str) -> str:
     canonicalisation cost (the common case in
     :meth:`BaseCrawler.normalize`).
 
-    Uses BLAKE3 if the ``blake3`` package is available; falls back
-    to SHA-256 otherwise. The Rust ingest path always uses BLAKE3,
-    but the Python side may run on hosts without a C toolchain —
-    the digest is only used for in-process dedup, not for
-    cross-language hashing.
+    Always uses BLAKE3 — ``blake3`` is a hard dependency
+    (``crawl/requirements.txt``) so the digest matches the Rust
+    ingest path's :func:`blake3::hash` byte-for-byte. The earlier
+    SHA-256 fallback was removed because it weakened the dedup
+    idempotency guarantee: hashes computed on a host without the
+    ``blake3`` wheel would not match hashes computed on a host
+    with it, so :meth:`Pipeline._load_known_hashes` would fail to
+    short-circuit a re-crawl after the dependency state changed.
     """
-    try:  # pragma: no cover - depends on optional install
-        import blake3 as _blake3  # type: ignore[import-not-found]
-
-        return _blake3.blake3(text.encode("utf-8")).hexdigest()
-    except ImportError:
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return blake3.blake3(text.encode("utf-8")).hexdigest()
 
 
 def count_tokens(text: str) -> int:
