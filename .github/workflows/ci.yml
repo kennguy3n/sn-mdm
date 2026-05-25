@@ -16,10 +16,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain (stable)
+        # ``pack_napi`` depends on napi-rs 3.x which requires
+        # rustc 1.88+, so the workspace's fmt / clippy / test
+        # signal runs on stable. The MSRV (1.85) signal for the
+        # rest of the workspace lives in the ``msrv`` job below
+        # and excludes ``pack_napi`` so the documented MSRV
+        # stays meaningful for ``pack_core`` and the Python
+        # pipeline.
         run: |
-          rustup toolchain install 1.85.0 --profile minimal --component clippy,rustfmt
-          rustup default 1.85.0
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -34,9 +41,9 @@ jobs:
           # ``restore-keys`` still lets us reuse the registry / git
           # caches across builds, so the cost is only a recompile
           # of the dependency tree, not a re-download.
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-stable-
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -46,6 +53,83 @@ jobs:
 
       - name: cargo test
         run: cargo test --all
+
+  msrv:
+    name: rust MSRV (1.85.0, excludes pack_napi)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.85.0)
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-msrv-
+
+      # ``pack_napi`` deliberately tracks the napi-rs 3.x MSRV
+      # (1.88+) rather than the workspace floor — see the
+      # ``rust-version`` comment in crates/napi/Cargo.toml.
+      # Excluding it here keeps the MSRV signal meaningful for
+      # ``pack_core`` and any other future crate that targets the
+      # workspace MSRV.
+      - name: cargo check --workspace --exclude pack_napi
+        run: cargo check --workspace --all-targets --exclude pack_napi
+
+  napi-build:
+    name: napi-build (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Share the cache key with the main ``rust`` job's
+          # stable Linux build so each leg warms the other.
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stable-
+
+      - name: cargo test -p pack_napi --lib
+        run: cargo test -p pack_napi --lib
+
+      - name: npm install (crates/napi)
+        working-directory: crates/napi
+        run: npm install --no-fund --no-audit
+
+      - name: napi build (debug, linux-x64-gnu)
+        working-directory: crates/napi
+        run: npm run build:debug
+
+      - name: node smoke tests
+        working-directory: crates/napi
+        run: node --test 'test/*.test.mjs'
 
   python:
     name: python (ruff / pytest)

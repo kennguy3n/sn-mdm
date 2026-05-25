@@ -40,7 +40,7 @@ pub use ingest::{IngestReport, IngestStats, PackStore};
 pub use metadata::{
     Chunk, ChunkingPolicy, Episode, Publisher, RightsRecord, Series, TagFamilies, DEFAULT_CHUNKING,
 };
-pub use search::{RankWeights, SearchEngine, SearchHit, SearchQuery, SearchScope};
+pub use search::{RankWeights, SearchEngine, SearchHit, SearchQuery, SearchScope, TagFilter};
 
 /// Schema version stamped into `PRAGMA user_version`. Bumped on every
 /// breaking schema change.

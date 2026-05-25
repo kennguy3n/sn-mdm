@@ -110,6 +110,83 @@ PackBuilder::new(&store)
 The resulting `.pack` is a zstd-compressed SQLite database
 framed with a manifest the agent verifies before mount.
 
+## Querying a `.pack`
+
+Two surfaces ship with the workspace; both wrap the same
+[`pack_core::SearchEngine`](crates/pack_core/src/search.rs)
+multi-lane query path (FTS5 BM25 + tag-filter + optional
+semantic cosine).
+
+### `pack-search` CLI
+
+A small Rust binary for shell-facing consumers. Opens a `.pack`,
+runs a query, prints results as newline-separated JSON or as
+human-readable text blocks:
+
+```bash
+cargo run --release --bin pack-search -- \
+    --pack packs/sn-mdm-tranche1.pack \
+    --query "venture capital network effects" \
+    --tags-industry retail,fintech \
+    --limit 5 \
+    --format text
+```
+
+Flags:
+
+- `--pack <path>` (required) — path to a `.pack` file.
+- `--query <text>` — FTS5 query string (optional; omit for a pure
+  tag-filter search).
+- `--tags-industry <csv>` — OR-within / AND-across tag filter on
+  the five families (`--tags-function`, `--tags-business-model`,
+  `--tags-geography`, `--tags-evidence-type`).
+- `--limit <n>` — defaults to 10.
+- `--format {json,text}` — defaults to `json`. JSON emits one
+  hit per line; `text` renders a human-readable block per hit
+  with BM25 + tag-match + semantic component scores.
+
+Exit codes: `0` success, `1` malformed CLI arguments, `2`
+pack-open / query failure.
+
+### Node.js native addon (`@sn-mdm/pack-napi`)
+
+A `napi-rs` 3.x N-API binding lives at
+[`crates/napi`](crates/napi/) and exposes the same surface to
+Node.js callers via a platform-specific `.node` artefact:
+
+```js
+const { openPack, search, closePack } = require('@sn-mdm/pack-napi');
+
+const handle = openPack('packs/sn-mdm-tranche1.pack');
+try {
+  const hits = search(handle, {
+    text: 'venture capital network effects',
+    tags: { industry: ['retail', 'fintech'] },
+    limit: 5,
+  });
+  console.log(hits);
+} finally {
+  closePack(handle);
+}
+```
+
+`openPack` returns a `BigInt` handle the caller must pass back
+to `search` and `closePack`. Errors are raised as JS `Error`
+instances whose `message` is a JSON envelope —
+`{"kind":"BadMagic","message":"...","detail":{...}}` — so callers
+can `switch (JSON.parse(e.message).kind)` on the finest-grained
+fault tag (`Io`, `BadMagic`, `TruncatedPack`, `ChecksumMismatch`,
+`RightsGateRefused`, `InvalidArgument`, `Internal`, …).
+
+Build the addon:
+
+```bash
+cd crates/napi
+npm install
+npm run build      # release; produces pack.<target>.node
+npm test           # node --test 'test/*.test.mjs'
+```
+
 ## Testing
 
 ```bash
