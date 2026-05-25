@@ -674,6 +674,58 @@ class BaseCrawler:
         assert last_exc is not None
         raise last_exc
 
+    def fetch_rendered(
+        self,
+        url: str,
+        *,
+        wait_for_selector: str | None = None,
+        wait_for_states: tuple[str, ...] = ("domcontentloaded",),
+        timeout_ms: int = 30_000,
+    ) -> bytes:
+        """Politely fetch ``url`` after rendering it in a real browser.
+
+        Mirrors the safety contract of :meth:`fetch` — robots.txt
+        check, rate-limit, custom User-Agent — but routes the
+        actual GET through the headless-Chromium transport in
+        :mod:`crawl.crawlers._browser`. Used by the seven Tranche
+        1 publishers whose index / episode pages are React /
+        Next.js / Drupal SPAs and therefore return an empty shell
+        to a plain ``requests`` GET.
+
+        Parameters mirror :func:`crawl.crawlers._browser.fetch_rendered`.
+        Returns the raw HTML bytes; the caller does its own
+        BeautifulSoup parsing exactly as it would with a
+        ``requests`` :class:`~requests.Response`.
+        """
+        # Defer the import so crawlers that never call this method
+        # don't pay for the (optional) Playwright dependency at
+        # import time. Imports are still cheap on the warm-cache
+        # path — Python caches the module object.
+        from crawl.crawlers import _browser
+
+        rp = self._robots_parser(url)
+        # The robots.txt check uses the configured ``requests``
+        # User-Agent for rule matching even when the actual fetch
+        # goes through Chromium. The two UA strings serve different
+        # purposes — one identifies the operator to robots.txt for
+        # access-control rules, the other tells the WAF we look
+        # like a desktop browser. Using the ``requests`` UA for the
+        # ``can_fetch`` lookup keeps the robots-rule semantics
+        # consistent across both transports: a site that disallows
+        # ``sn-mdm-crawler`` blocks us regardless of how we'd
+        # actually fetch the page.
+        ua = self.session.headers.get("User-Agent", DEFAULT_USER_AGENT)
+        if not rp.can_fetch(ua, url):
+            raise PermissionError(f"robots.txt disallows {url} for {ua}")
+        self._respect_rate_limit()
+        html_bytes, _content_type = _browser.fetch_rendered(
+            url,
+            wait_for_selector=wait_for_selector,
+            wait_for_states=wait_for_states,
+            timeout_ms=timeout_ms,
+        )
+        return html_bytes
+
     # -- contract surface --------------------------------------------------
 
     def initial_sync(self) -> Iterator[RawEpisode]:
