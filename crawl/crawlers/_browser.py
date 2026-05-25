@@ -54,6 +54,7 @@ shims.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import logging
 import os
 import threading
@@ -115,6 +116,15 @@ class _BrowserState:
         """Return a live :class:`BrowserContext`, opening Chromium
         on the first call. Safe to call from multiple threads
         (though the rest of the crawler is single-threaded today).
+
+        If Playwright / Chromium / new_context() raises partway
+        through initialisation, every partially-assigned handle is
+        torn down before the exception bubbles. This keeps the
+        invariant that ``self._playwright is None`` after a failed
+        init — a subsequent retry from another caller can then
+        safely run ``sync_playwright().start()`` without leaking
+        the previous Playwright host process, and the ``atexit``
+        ``_shutdown`` never tries to close half-built handles.
         """
         with self._lock:
             if self._context is not None:
@@ -122,43 +132,66 @@ class _BrowserState:
             from playwright.sync_api import sync_playwright
 
             LOG.info("browser: opening headless Chromium (one-time)")
-            self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(
-                headless=True,
-                args=[
-                    # The flag that flips ``navigator.webdriver`` off
-                    # in modern Chromium builds. Without it every
-                    # rendered page leaks the bot signal that almost
-                    # every WAF checks for first.
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                    # Smaller fingerprint surface in CI sandboxes.
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-            self._context = self._browser.new_context(
-                user_agent=os.environ.get("SN_MDM_BROWSER_UA", _DEFAULT_USER_AGENT),
-                viewport=_DEFAULT_VIEWPORT,
-                locale=_DEFAULT_LOCALE,
-                timezone_id=_DEFAULT_TIMEZONE,
-                extra_http_headers={
-                    "Sec-CH-UA": _DEFAULT_SEC_CH_UA,
-                    "Sec-CH-UA-Mobile": "?0",
-                    "Sec-CH-UA-Platform": '"macOS"',
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            )
-            # Block the heavyweight resource types we never look at
-            # — images, fonts, media. Cuts page-load wall-clock by
-            # roughly half on the slow SPAs (TED, McKinsey) and
-            # keeps the per-context memory bounded.
-            self._context.route(
-                "**/*",
-                lambda route: route.abort()
-                if route.request.resource_type in {"image", "media", "font"}
-                else route.continue_(),
-            )
+            playwright = None
+            browser = None
+            try:
+                playwright = sync_playwright().start()
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        # The flag that flips ``navigator.webdriver`` off
+                        # in modern Chromium builds. Without it every
+                        # rendered page leaks the bot signal that almost
+                        # every WAF checks for first.
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                        # Smaller fingerprint surface in CI sandboxes.
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+                context = browser.new_context(
+                    user_agent=os.environ.get("SN_MDM_BROWSER_UA", _DEFAULT_USER_AGENT),
+                    viewport=_DEFAULT_VIEWPORT,
+                    locale=_DEFAULT_LOCALE,
+                    timezone_id=_DEFAULT_TIMEZONE,
+                    extra_http_headers={
+                        "Sec-CH-UA": _DEFAULT_SEC_CH_UA,
+                        "Sec-CH-UA-Mobile": "?0",
+                        "Sec-CH-UA-Platform": '"macOS"',
+                        "Accept-Language": "en-US,en;q=0.9",
+                    },
+                )
+                # Block the heavyweight resource types we never look at
+                # — images, fonts, media. Cuts page-load wall-clock by
+                # roughly half on the slow SPAs (TED, McKinsey) and
+                # keeps the per-context memory bounded.
+                context.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in {"image", "media", "font"}
+                    else route.continue_(),
+                )
+            except BaseException:
+                # Partial-init rollback: tear down whatever we did
+                # bring up, in reverse order, so a follow-up call to
+                # ``context()`` starts from a clean slate. We
+                # swallow individual cleanup errors because the
+                # outer exception is what the caller cares about.
+                if browser is not None:
+                    with contextlib.suppress(Exception):
+                        browser.close()
+                if playwright is not None:
+                    with contextlib.suppress(Exception):
+                        playwright.stop()
+                raise
+            # All three handles came up successfully — publish them
+            # to ``self`` as a single atomic step. Until this point
+            # ``self._playwright is None`` so the ``atexit``
+            # ``_shutdown`` is a no-op.
+            self._playwright = playwright
+            self._browser = browser
+            self._context = context
             return self._context
 
     def cache_get(self, key: tuple[object, ...]) -> tuple[bytes, str] | None:
@@ -284,7 +317,15 @@ def fetch_rendered(
         # ``timeout_ms`` budget floored at 1 s so zero-budget
         # failures don't tip an otherwise-healthy fetch into
         # ``TimeoutError`` (see ``timeout_ms`` docstring above).
-        first_state, *rest_states = wait_for_states
+        # ``states_key`` is the already-materialised tuple from the
+        # cache-key block above; reusing it here avoids consuming
+        # the caller's iterable twice. A generator passed in as
+        # ``wait_for_states`` would have been drained by the first
+        # ``tuple()`` call and would raise ``ValueError`` on this
+        # unpack — the type contract permits any ``Iterable[str]``,
+        # so we treat the materialised tuple as the source of
+        # truth from this point on.
+        first_state, *rest_states = states_key
         page.goto(url, wait_until=first_state, timeout=timeout_ms)
         for state in rest_states:
             remaining = timeout_ms - int((time.monotonic() - started) * 1000)
@@ -316,16 +357,20 @@ def warmup_origin(origin: str) -> None:
 
     Used today by :class:`crawl.crawlers.wef_radio_davos.WefRadioDavosCrawler`
     via :meth:`BaseCrawler.warmup_origin` — see that method for
-    the per-crawler robots.txt + rate-limit wrapping.
+    the per-crawler robots.txt + rate-limit wrapping and for the
+    best-effort error policy. This low-level helper does **not**
+    swallow the underlying browser error — propagating it lets
+    :meth:`BaseCrawler.warmup_origin` decide whether the warmup
+    is best-effort (the WEF case) or a hard precondition for the
+    crawl (a future caller may treat it as fatal). Callers that
+    want best-effort semantics should wrap the call in
+    :func:`contextlib.suppress`.
     """
     parsed = urllib.parse.urlparse(origin)
     if not parsed.scheme or not parsed.netloc:
         raise ValueError(f"warmup_origin: not an absolute origin: {origin!r}")
     root = f"{parsed.scheme}://{parsed.netloc}/"
-    try:
-        fetch_rendered(root, use_cache=False, timeout_ms=20_000)
-    except Exception as exc:  # noqa: BLE001 - warmup is best-effort
-        LOG.warning("browser: warmup_origin(%s) failed: %s", root, exc)
+    fetch_rendered(root, use_cache=False, timeout_ms=20_000)
 
 
 __all__ = ["fetch_rendered", "warmup_origin"]

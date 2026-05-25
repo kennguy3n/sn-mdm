@@ -23,11 +23,11 @@ honoured by the wrapper.
 
 from __future__ import annotations
 
-import json
 import re
 
 from bs4 import BeautifulSoup
 
+from . import _jsonld
 from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 
 _HUB_URL = "https://www.rbc.com/en/thought-leadership/disruptors/"
@@ -192,6 +192,14 @@ def _decode_html_entities(text: str) -> str:
     return html.unescape(text)
 
 
+# JSON-LD ``@type`` values we accept as canonical RBC episode
+# metadata. ``Article`` ships inside RBC's ``@graph`` envelope
+# (with ``wordCount`` and the real ``author`` ID); ``NewsArticle``
+# is the standalone block (with a placeholder author). The shared
+# walker yields them in document order, and the first match wins.
+_JSONLD_EPISODE_TYPES = frozenset({"Article", "NewsArticle"})
+
+
 def _extract_jsonld_metadata(soup: BeautifulSoup) -> dict[str, object]:
     """Pull RBC's ``schema.org/Article`` JSON-LD payload.
 
@@ -200,41 +208,26 @@ def _extract_jsonld_metadata(soup: BeautifulSoup) -> dict[str, object]:
     standalone ``NewsArticle`` payload. The ``Article`` inside the
     ``@graph`` is the canonical one (it has ``wordCount`` and the
     real ``author`` ID); the ``NewsArticle`` repeats most of the
-    same fields but with a placeholder author. We prefer the
-    ``Article`` graph node when present and fall back to the
-    standalone ``NewsArticle``.
+    same fields but with a placeholder author. We walk both blocks
+    in document order via the shared ``_jsonld`` helper (the same
+    walker WEF uses, so any new JSON-LD shape support lands here
+    automatically) and return the first acceptable payload.
     """
-
-    def _pick(article: dict[str, object]) -> dict[str, object]:
-        out: dict[str, object] = {}
-        if isinstance(article.get("headline"), str):
-            out["headline"] = article["headline"]
-        if isinstance(article.get("datePublished"), str):
-            out["datePublished"] = article["datePublished"]
-        if isinstance(article.get("description"), str):
-            out["description"] = article["description"]
-        return out
-
-    # Walk JSON-LD blocks in document order; first acceptable
-    # payload wins.
     for s in soup.find_all("script", type="application/ld+json"):
         raw = s.string or s.text or ""
         if not raw:
             continue
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            if "@graph" in data and isinstance(data["@graph"], list):
-                for node in data["@graph"]:
-                    if isinstance(node, dict) and node.get("@type") in (
-                        "Article",
-                        "NewsArticle",
-                    ):
-                        return _pick(node)
-            elif data.get("@type") in ("Article", "NewsArticle"):
-                return _pick(data)
+        for node in _jsonld.iter_jsonld_objects(raw):
+            if not _jsonld.type_matches(node, _JSONLD_EPISODE_TYPES):
+                continue
+            out: dict[str, object] = {}
+            if isinstance(node.get("headline"), str):
+                out["headline"] = node["headline"]
+            if isinstance(node.get("datePublished"), str):
+                out["datePublished"] = node["datePublished"]
+            if isinstance(node.get("description"), str):
+                out["description"] = node["description"]
+            return out
     return {}
 
 

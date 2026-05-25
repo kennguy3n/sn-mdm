@@ -39,11 +39,11 @@ try to walk the whole 200+ episode archive in one shot.
 from __future__ import annotations
 
 import contextlib
-import json
 import re
 
 from bs4 import BeautifulSoup
 
+from . import _jsonld
 from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 
 _HUB_URL = "https://www.weforum.org/podcasts/radio-davos/"
@@ -71,9 +71,13 @@ class WefRadioDavosCrawler(BaseCrawler):
         # gets bounced by the WAF while the session cookie is
         # being issued; hitting the origin root first reliably
         # primes that cookie so the hub fetch succeeds on the
-        # first try. Failures are warnings — the subsequent
-        # ``fetch_rendered`` retry contract still catches a
-        # transient bounce.
+        # first try. The warmup is best-effort for WEF — both
+        # ``BaseCrawler.warmup_origin`` (robots / rate-limit
+        # checks) and ``_browser.warmup_origin`` (the actual
+        # navigation) can raise, and either failure mode is fine
+        # to ignore because the subsequent ``fetch_rendered``
+        # retry contract still catches a transient bounce and the
+        # main fetch re-applies the robots.txt check.
         with contextlib.suppress(Exception):
             self.warmup_origin("https://www.weforum.org/")
         # Wait for ``networkidle`` so the hub page's lazy-loaded
@@ -225,52 +229,6 @@ def _meta_description(soup: BeautifulSoup) -> str:
 _JSONLD_EPISODE_TYPES = frozenset(
     {"CreativeWork", "PodcastEpisode", "NewsArticle", "Article"}
 )
-# Strip the CDATA wrapper WEF emits around its JSON-LD payload.
-# The actual JSON content sits between the first ``{`` or ``[``
-# and the matching last ``}`` or ``]`` — we feed the whole
-# stripped string to ``json.loads`` rather than substring-matching
-# with a regex, because a greedy ``{...}`` regex would silently
-# corrupt ``[{...}, {...}]`` array payloads (see
-# :func:`_iter_jsonld_objects`).
-_CDATA_SHELL_RE = re.compile(r"^\s*//\s*<!\[CDATA\[|//\s*]]>\s*$", flags=re.M)
-
-
-def _iter_jsonld_objects(raw: str):
-    """Yield each dict in a JSON-LD payload.
-
-    Handles three shapes WEF and other publishers emit:
-
-    1. ``{"@type": "Article", ...}`` — a single object.
-    2. ``[{...}, {...}]`` — a top-level array of objects (the
-       shape RBC uses; WEF could plausibly migrate to this).
-    3. ``{"@context": ..., "@graph": [{...}, {...}]}`` — the
-       ``@graph`` envelope WordPress's JSON-LD plugin produces.
-
-    Strips the WEF CDATA shell first. We parse the entire payload
-    rather than substring-extracting with a regex because a
-    greedy ``{.*}`` regex would yield invalid JSON on the array
-    and ``@graph`` shapes, silently losing metadata.
-    """
-    payload = _CDATA_SHELL_RE.sub("", raw).strip()
-    if not payload:
-        return
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
-        return
-    if isinstance(data, dict):
-        graph = data.get("@graph")
-        if isinstance(graph, list):
-            for item in graph:
-                if isinstance(item, dict):
-                    yield item
-            return
-        yield data
-        return
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                yield item
 
 
 def _extract_jsonld_metadata(soup: BeautifulSoup) -> dict[str, object]:
@@ -280,21 +238,16 @@ def _extract_jsonld_metadata(soup: BeautifulSoup) -> dict[str, object]:
     holding a ``CreativeWork`` (sometimes wrapped in CDATA, and
     occasionally inside an ``@graph`` envelope). When present we
     trust those fields over the looser title/date regexes in
-    :class:`BaseCrawler` — the JSON-LD is canonical.
+    :class:`BaseCrawler` — the JSON-LD is canonical. Shape-walking
+    is delegated to :func:`_jsonld.iter_jsonld_objects` so RBC and
+    any future JSON-LD publisher pick up the same robustness.
     """
     for s in soup.find_all("script", type="application/ld+json"):
         raw = s.string or s.text or ""
         if not raw:
             continue
-        for data in _iter_jsonld_objects(raw):
-            t = data.get("@type")
-            if isinstance(t, list):
-                # JSON-LD permits ``@type`` to be a list (e.g.
-                # ``["NewsArticle", "PodcastEpisode"]``); accept
-                # if any member matches.
-                if not any(tt in _JSONLD_EPISODE_TYPES for tt in t if isinstance(tt, str)):
-                    continue
-            elif t not in _JSONLD_EPISODE_TYPES:
+        for data in _jsonld.iter_jsonld_objects(raw):
+            if not _jsonld.type_matches(data, _JSONLD_EPISODE_TYPES):
                 continue
             out: dict[str, object] = {}
             if isinstance(data.get("headline"), str):

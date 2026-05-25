@@ -557,3 +557,219 @@ def test_rbc_normalises_only_transcript_section(
     assert "Intro paragraph that lives above the transcript" not in text
     assert "Subscribe" not in text or "## Subscribe" not in text
     assert "must not leak into the chunked text" not in text
+
+
+# ---------------------------------------------------------------------------
+# Shared JSON-LD helper (`_jsonld`)
+# ---------------------------------------------------------------------------
+
+
+def test_jsonld_helper_handles_single_object() -> None:
+    """Single-object payload yields exactly that object."""
+    from crawl.crawlers import _jsonld
+
+    out = list(_jsonld.iter_jsonld_objects('{"@type": "Article", "headline": "x"}'))
+    assert out == [{"@type": "Article", "headline": "x"}]
+
+
+def test_jsonld_helper_handles_top_level_array() -> None:
+    """Array payload yields every dict in order; non-dicts are
+    filtered out so the caller can iterate without ``isinstance``
+    checks of its own.
+    """
+    from crawl.crawlers import _jsonld
+
+    out = list(
+        _jsonld.iter_jsonld_objects(
+            '[{"@type": "BreadcrumbList"}, "junk", {"@type": "Article", "headline": "x"}]'
+        )
+    )
+    assert out == [
+        {"@type": "BreadcrumbList"},
+        {"@type": "Article", "headline": "x"},
+    ]
+
+
+def test_jsonld_helper_handles_graph_envelope() -> None:
+    """``@graph`` envelope is walked into; the outer wrapper is
+    not yielded (it carries no episode-level fields).
+    """
+    from crawl.crawlers import _jsonld
+
+    raw = (
+        '{"@context": "https://schema.org", '
+        '"@graph": [{"@type": "WebPage"}, {"@type": "Article", "headline": "x"}]}'
+    )
+    out = list(_jsonld.iter_jsonld_objects(raw))
+    assert out == [{"@type": "WebPage"}, {"@type": "Article", "headline": "x"}]
+
+
+def test_jsonld_helper_strips_cdata_shell() -> None:
+    """CDATA-wrapped payloads (WEF) parse identically to bare
+    payloads — the wrapper is a template-engine artefact, not
+    part of the JSON contract.
+    """
+    from crawl.crawlers import _jsonld
+
+    raw = (
+        '// <![CDATA[\n'
+        '{"@type": "PodcastEpisode", "headline": "cdata"}\n'
+        '// ]]>\n'
+    )
+    out = list(_jsonld.iter_jsonld_objects(raw))
+    assert out == [{"@type": "PodcastEpisode", "headline": "cdata"}]
+
+
+def test_jsonld_helper_yields_nothing_on_malformed_payload() -> None:
+    """A payload that isn't valid JSON yields an empty iterator
+    rather than raising — the caller iterates without try/except
+    and just gets no metadata.
+    """
+    from crawl.crawlers import _jsonld
+
+    assert list(_jsonld.iter_jsonld_objects("not json at all {[}")) == []
+    assert list(_jsonld.iter_jsonld_objects("")) == []
+    assert list(_jsonld.iter_jsonld_objects("42")) == []
+
+
+def test_jsonld_type_matches_handles_list_type() -> None:
+    """``@type`` can be a list per the JSON-LD spec; matching is
+    set-membership against any element.
+    """
+    from crawl.crawlers import _jsonld
+
+    wanted = frozenset({"PodcastEpisode", "Article"})
+    assert _jsonld.type_matches({"@type": "Article"}, wanted)
+    assert _jsonld.type_matches({"@type": ["NewsArticle", "PodcastEpisode"]}, wanted)
+    assert not _jsonld.type_matches({"@type": "BreadcrumbList"}, wanted)
+    assert not _jsonld.type_matches({"@type": ["WebPage", "Organization"]}, wanted)
+    assert not _jsonld.type_matches({}, wanted)
+
+
+def test_rbc_extractor_handles_top_level_array_jsonld() -> None:
+    """After the shared-helper refactor, RBC's extractor inherits
+    array-shape support — a regression-proof for the case where
+    WordPress's plugin starts emitting arrays per the
+    ``@type``-as-list note above.
+    """
+    from bs4 import BeautifulSoup
+
+    from crawl.crawlers.rbc_disruptors import _extract_jsonld_metadata
+
+    html = (
+        '<html><head><script type="application/ld+json">'
+        '[{"@type": "BreadcrumbList"}, '
+        '{"@type": "Article", "headline": "RBC array shape", '
+        '"datePublished": "2026-05-15"}]'
+        '</script></head><body></body></html>'
+    )
+    soup = BeautifulSoup(html, "html.parser")
+    md = _extract_jsonld_metadata(soup)
+    assert md["headline"] == "RBC array shape"
+    assert md["datePublished"] == "2026-05-15"
+
+
+# ---------------------------------------------------------------------------
+# _browser.fetch_rendered: iterable contract
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_rendered_accepts_generator_wait_for_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The signature declares ``Iterable[str]`` so passing a
+    generator must work. Pre-fix the implementation drained the
+    generator into the cache key and then unpacked it a second
+    time at the goto step, raising ``ValueError: not enough
+    values to unpack``.
+    """
+    from crawl.crawlers import _browser
+
+    captured: dict[str, Any] = {}
+
+    class _Page:
+        def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+            captured["first_state"] = wait_until
+            captured["url"] = url
+
+        def wait_for_load_state(self, state: str, *, timeout: int) -> None:
+            captured.setdefault("rest_states", []).append(state)
+
+        def content(self) -> str:
+            return "<html></html>"
+
+        def close(self) -> None:
+            pass
+
+    class _Ctx:
+        def new_page(self) -> _Page:
+            return _Page()
+
+    monkeypatch.setattr(_browser._STATE, "context", lambda: _Ctx())
+    # Empty the LRU so we exercise the fetch path, not the cache.
+    monkeypatch.setattr(_browser._STATE, "_cache", type(_browser._STATE._cache)())
+
+    def _states():
+        yield "domcontentloaded"
+        yield "networkidle"
+
+    html_bytes, _ct = _browser.fetch_rendered(
+        "https://example.com/", wait_for_states=_states(), use_cache=False
+    )
+    assert html_bytes == b"<html></html>"
+    assert captured["first_state"] == "domcontentloaded"
+    assert captured["rest_states"] == ["networkidle"]
+
+
+# ---------------------------------------------------------------------------
+# _browser.context partial-init cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_browser_context_rolls_back_on_partial_init_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If Chromium fails to launch midway through
+    ``_BrowserState.context()``, the singleton must NOT retain
+    the partially-built Playwright handle — otherwise a follow-up
+    call would overwrite it with a fresh start() and leak the
+    previous Playwright host process, and the atexit shutdown
+    would try to ``.stop()`` a torn-down handle.
+    """
+    from crawl.crawlers import _browser
+
+    state = _browser._BrowserState()
+
+    closed = {"playwright": False, "browser": False}
+
+    class _Pw:
+        def stop(self) -> None:
+            closed["playwright"] = True
+
+        class chromium:  # noqa: N801 - mirrors Playwright API shape
+            @staticmethod
+            def launch(**_kw: Any) -> Any:
+                raise RuntimeError("simulated chromium launch failure")
+
+    class _PwFactory:
+        def start(self) -> _Pw:
+            return _Pw()
+
+    # Intercept sync_playwright() at import time inside context().
+    import sys
+    import types
+
+    fake_module = types.ModuleType("playwright.sync_api")
+    fake_module.sync_playwright = lambda: _PwFactory()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_module)
+
+    with pytest.raises(RuntimeError, match="simulated chromium launch failure"):
+        state.context()
+
+    # All three handles must be back to None so a subsequent
+    # retry starts from a clean slate.
+    assert state._playwright is None
+    assert state._browser is None
+    assert state._context is None
+    # And the partial Playwright handle was stopped during rollback.
+    assert closed["playwright"] is True
