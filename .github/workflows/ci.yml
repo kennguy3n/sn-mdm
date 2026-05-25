@@ -8,15 +8,18 @@ on:
 permissions:
   contents: read
 
-# Single source of truth for the pinned rustc release used by the
-# ``rust`` and ``napi-build`` jobs. Promoted to a workflow-level env
-# var so the toolchain-install step and the cache key can't drift:
-# a one-line bump to ``RUST_TOOLCHAIN`` propagates everywhere. The
-# MSRV job pins 1.85.0 separately because it covers the workspace
-# floor, not the napi-rs 3.x effective MSRV — see the ``msrv`` job
-# comment below.
+# Single source of truth for the pinned rustc releases used by the
+# CI jobs. Promoted to workflow-level env vars so each job's
+# toolchain-install step and cache key reference the same value and
+# can't drift: a one-line bump propagates everywhere. ``RUST_MSRV``
+# is a separate pin from ``RUST_TOOLCHAIN`` because it tracks the
+# workspace floor (consumed by ``pack_core`` and other workspace-MSRV
+# crates), while ``RUST_TOOLCHAIN`` tracks the napi-rs 3.x effective
+# MSRV (1.88+) needed by ``pack_napi`` — see the ``msrv`` job
+# comment below for the full split.
 env:
   RUST_TOOLCHAIN: "1.88.0"
+  RUST_MSRV: "1.85.0"
 
 jobs:
   rust:
@@ -73,16 +76,16 @@ jobs:
         run: cargo test --all
 
   msrv:
-    name: rust MSRV (1.85.0, excludes pack_napi)
+    name: rust MSRV (${{ env.RUST_MSRV }}, excludes pack_napi)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (1.85.0)
+      - name: Install Rust toolchain (MSRV)
         run: |
-          rustup toolchain install 1.85.0 --profile minimal
-          rustup default 1.85.0
+          rustup toolchain install "$RUST_MSRV" --profile minimal
+          rustup default "$RUST_MSRV"
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -91,8 +94,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          # Include ``RUST_MSRV`` in the cache key so a future MSRV
+          # bump cleanly invalidates the previous build artefacts —
+          # symmetric with the ``rust`` and ``napi-build`` jobs above.
+          key: ${{ runner.os }}-cargo-msrv-${{ env.RUST_MSRV }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-msrv-${{ env.RUST_MSRV }}-
             ${{ runner.os }}-cargo-msrv-
 
       # ``pack_napi`` deliberately tracks the napi-rs 3.x MSRV
