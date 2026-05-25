@@ -528,3 +528,308 @@ def test_exit_code_zero_on_empty_run() -> None:
     # or a dry-run with no crawlers registered.
     totals = PublisherStats(publisher_id="__totals__")
     assert exit_code_for(totals) == 0
+
+
+# ----------------------------------------------------------------------
+# Milestone E — --incremental sync mode
+# ----------------------------------------------------------------------
+
+
+def test_exit_code_zero_on_fully_incremental_skipped_re_run() -> None:
+    """``--incremental`` steady-state: every slug was short-circuited
+    before the fetch because its episode_id was already in the
+    governance log. That's the documented success path — re-running
+    on a pack that already has every episode must NOT return 1.
+    """
+    totals = PublisherStats(
+        publisher_id="__totals__",
+        episodes_seen=0,
+        episodes_admitted=0,
+        episodes_skipped_incremental=42,
+    )
+    assert exit_code_for(totals) == 0
+
+
+def test_incremental_sync_skips_known_episode_ids(tmp_path: Path) -> None:
+    """The incremental skip predicate must fire *before*
+    ``fetch_transcript`` so the HTTP cost of re-pulling already-
+    ingested episodes is avoided. Slugs whose canonical
+    ``episode_id`` is in the known set never reach the fetcher;
+    unknown slugs do.
+    """
+    cfg = _merge_config(seeds=["seed-a", "seed-b"])
+    crawler = DiscoveryMergeCrawler(
+        cfg, tmp_path, discovered=["discovered-c", "discovered-d"]
+    )
+    # Pre-bake the canonical episode_id for "seed-a" + "discovered-c"
+    # so those two slugs are claimed by a prior run.
+    known = frozenset(
+        {
+            crawler.episode_id_for_slug("seed-a"),
+            crawler.episode_id_for_slug("discovered-c"),
+        }
+    )
+    list(crawler.incremental_sync(known_episode_ids=known))
+    # The two unknown slugs are still fetched in first-seen order.
+    assert crawler.fetched == ["seed-b", "discovered-d"]
+    # The crawler exposes the skip count so the pipeline can roll
+    # it into PublisherStats.
+    assert crawler.last_incremental_skip_count == 2
+
+
+def test_incremental_sync_empty_cursor_falls_back_to_full_walk(
+    tmp_path: Path,
+) -> None:
+    """Bootstrap case: an empty / missing known set must run the
+    full initial_sync walk so the first crawl of a fresh packs
+    tree still produces every episode. This is the documented
+    safe default and is what makes incremental mode additive
+    over initial_sync rather than narrower.
+    """
+    cfg = _merge_config(seeds=["seed-a"])
+    crawler = DiscoveryMergeCrawler(cfg, tmp_path, discovered=["discovered-b"])
+    list(crawler.incremental_sync(known_episode_ids=frozenset()))
+    assert crawler.fetched == ["seed-a", "discovered-b"]
+    # No skips because we fell through to initial_sync; the
+    # counter was reset on entry.
+    assert crawler.last_incremental_skip_count == 0
+
+
+def test_incremental_sync_none_cursor_also_falls_back(tmp_path: Path) -> None:
+    """``None`` and ``frozenset()`` must both trigger the
+    initial_sync fallback so callers don't have to guess which
+    falsy sentinel to send. Pinned by a separate test because the
+    ``or`` short-circuit in ``frozenset(known_episode_ids or ())``
+    was the kind of mistake that would silently let ``None`` fall
+    through as "no known IDs, run full walk" only by accident.
+    """
+    cfg = _merge_config(seeds=["seed-x"])
+    crawler = DiscoveryMergeCrawler(cfg, tmp_path, discovered=[])
+    list(crawler.incremental_sync(known_episode_ids=None))
+    assert crawler.fetched == ["seed-x"]
+    assert crawler.last_incremental_skip_count == 0
+
+
+def test_incremental_sync_skips_all_when_all_known(tmp_path: Path) -> None:
+    """If every slug is already in the known set, ``fetched``
+    stays empty (no HTTP fetch issued) and the skip count equals
+    the total slug count. This is the steady-state regression
+    case for ``exit_code_for``.
+    """
+    cfg = _merge_config(seeds=["a", "b"])
+    crawler = DiscoveryMergeCrawler(cfg, tmp_path, discovered=["c"])
+    known = frozenset(
+        crawler.episode_id_for_slug(s) for s in ("a", "b", "c")
+    )
+    list(crawler.incremental_sync(known_episode_ids=known))
+    assert crawler.fetched == []
+    assert crawler.last_incremental_skip_count == 3
+
+
+def test_pipeline_incremental_mode_no_governance_log_runs_full_walk(
+    tmp_path: Path,
+) -> None:
+    """``Pipeline(incremental=True)`` against a packs root with no
+    governance log must produce the same output as the default
+    mode: the per-publisher known set is empty, the base
+    ``incremental_sync`` falls through to ``initial_sync``, and
+    the regular content-hash dedup gate handles idempotency.
+    This is the bootstrap regression case.
+    """
+    _register_fake()
+    pipeline = Pipeline(
+        configs={"fake": _config()},
+        packs_root=tmp_path,
+        incremental=True,
+    )
+    report = pipeline.run(["fake"])
+    stats = report.by_publisher["fake"]
+    # FakeCrawler overrides initial_sync directly, yielding one
+    # episode. With an empty known set the base incremental_sync
+    # delegates to initial_sync, so the episode flows through.
+    assert stats.episodes_seen == 1
+    assert stats.episodes_admitted == 1
+    assert stats.episodes_skipped_incremental == 0
+
+
+def test_pipeline_load_known_episode_ids_groups_by_publisher_prefix(
+    tmp_path: Path,
+) -> None:
+    """The governance-log reader must partition episode_ids by
+    publisher prefix so each crawler sees only its own admitted
+    set. Deprecated rows must be excluded so a future re-crawl
+    under a different rights code can still admit them.
+    """
+    _register_fake()
+    gov = tmp_path / "governance" / "rights_log.jsonl"
+    gov.parent.mkdir(parents=True, exist_ok=True)
+    gov.write_text(
+        "\n".join(
+            json.dumps(rec)
+            for rec in [
+                {
+                    "episode_id": "fake_flagship_ep1",
+                    "rights_code": "free_access_copyrighted",
+                    "ingestion_date": 1700000000,
+                    "content_hash": "h1",
+                    "deprecated": False,
+                },
+                {
+                    "episode_id": "fake_flagship_ep2",
+                    "rights_code": "free_access_copyrighted",
+                    "ingestion_date": 1700000001,
+                    "content_hash": "h2",
+                    "deprecated": False,
+                },
+                {
+                    # Deprecated row — must NOT land in the skip set.
+                    "episode_id": "fake_flagship_ep3-rejected",
+                    "rights_code": "paywalled",
+                    "ingestion_date": 1700000002,
+                    "content_hash": "h3",
+                    "deprecated": True,
+                },
+                {
+                    # Different publisher prefix — must not bleed
+                    # into the fake publisher's skip set.
+                    "episode_id": "otherpub_flagship_xyz",
+                    "rights_code": "free_access_copyrighted",
+                    "ingestion_date": 1700000003,
+                    "content_hash": "h4",
+                    "deprecated": False,
+                },
+            ]
+        )
+        + "\n"
+    )
+    pipeline = Pipeline(
+        configs={"fake": _config()},
+        packs_root=tmp_path,
+        incremental=True,
+    )
+    known = pipeline._known_ids_for("fake")
+    assert known == frozenset(
+        {"fake_flagship_ep1", "fake_flagship_ep2"}
+    )
+    # An unknown publisher (no config) returns an empty set
+    # rather than raising — defensive against a registry reshuffle
+    # that removes a publisher while the governance log still has
+    # its history.
+    assert pipeline._known_ids_for("otherpub") == frozenset()
+
+
+def test_pipeline_incremental_skip_count_rolls_into_stats(
+    tmp_path: Path,
+) -> None:
+    """When the crawler skips slugs via the base incremental flow,
+    the pipeline must read ``last_incremental_skip_count`` from the
+    crawler and roll it into :class:`PublisherStats` so the CLI
+    summary and ``exit_code_for`` see the short-circuit count.
+    """
+    # Register the DiscoveryMergeCrawler under a unique publisher
+    # id so the pipeline can drive it. We can't use the global
+    # ``_register_fake`` helper because DiscoveryMergeCrawler's
+    # ``__init__`` takes a ``discovered`` kwarg that the pipeline
+    # doesn't know about. Wrap it in a thin factory.
+    from crawl import crawlers
+    from crawl.crawlers.base import CrawlerConfig
+
+    class _PreDiscoveredCrawler(DiscoveryMergeCrawler):
+        publisher_id = "predisc"
+
+        def __init__(self, config: CrawlerConfig, packs_root: Path) -> None:
+            super().__init__(
+                config=config,
+                packs_root=packs_root,
+                discovered=["d-1", "d-2"],
+            )
+
+    crawlers._REGISTRY["predisc"] = _PreDiscoveredCrawler  # type: ignore[attr-defined]
+
+    cfg = _merge_config(seeds=["s-1"])
+    cfg = CrawlerConfig(
+        publisher_id="predisc",
+        publisher_name=cfg.publisher_name,
+        base_url=cfg.base_url,
+        rights_code=cfg.rights_code,
+        rights_summary=cfg.rights_summary,
+        country_region=cfg.country_region,
+        industry_tags=cfg.industry_tags,
+        function_tags=cfg.function_tags,
+        business_model_tags=cfg.business_model_tags,
+        source_type=cfg.source_type,
+        language=cfg.language,
+        host=cfg.host,
+        episodes=["s-1"],
+    )
+
+    # Pre-seed governance log with one of the discovered ids so
+    # the incremental skip fires for that slug.
+    gov = tmp_path / "governance" / "rights_log.jsonl"
+    gov.parent.mkdir(parents=True, exist_ok=True)
+    gov.write_text(
+        json.dumps(
+            {
+                "episode_id": "predisc_flagship_d-1",
+                "rights_code": "free_access_copyrighted",
+                "ingestion_date": 1700000000,
+                "content_hash": "h-d-1",
+                "deprecated": False,
+            }
+        )
+        + "\n"
+    )
+
+    pipeline = Pipeline(
+        configs={"predisc": cfg},
+        packs_root=tmp_path,
+        incremental=True,
+    )
+    report = pipeline.run(["predisc"])
+    stats = report.by_publisher["predisc"]
+    # Two slugs reached the fetcher (s-1, d-2), one was skipped (d-1).
+    assert stats.episodes_seen == 2
+    assert stats.episodes_skipped_incremental == 1
+
+
+def test_incremental_sync_log_line_uses_incremental_prefix(
+    tmp_path: Path, caplog
+) -> None:
+    """The shared ``_enumerate_slugs`` machinery logs which mode is
+    driving it so an operator reading a noisy run log can tell
+    initial-mode noise from incremental-mode noise. The prefix
+    flips based on the caller.
+    """
+    import logging
+
+    cfg = _merge_config(seeds=["a"])
+    crawler = DiscoveryMergeCrawler(cfg, tmp_path, discovered=[])
+    known = frozenset({crawler.episode_id_for_slug("a")})
+    with caplog.at_level(logging.INFO, logger="crawl.crawlers.base"):
+        list(crawler.incremental_sync(known_episode_ids=known))
+    msgs = [rec.getMessage() for rec in caplog.records]
+    # The enumeration line is tagged with the incremental prefix.
+    assert any("incremental_sync — 1 seed + 0 discovered" in m for m in msgs)
+    # And the per-run summary names the skip count.
+    assert any(
+        "incremental_sync — 1 known skipped, 0 candidates fetched" in m
+        for m in msgs
+    )
+
+
+def test_initial_sync_log_line_keeps_initial_prefix(
+    tmp_path: Path, caplog
+) -> None:
+    """Regression: factoring ``_enumerate_slugs`` out of
+    ``initial_sync`` must not change the initial-sync log line's
+    tag. Operators rely on the substring ``initial_sync —`` to
+    grep the boot phase of the pipeline.
+    """
+    import logging
+
+    cfg = _merge_config(seeds=["a", "b"])
+    crawler = DiscoveryMergeCrawler(cfg, tmp_path, discovered=["c"])
+    with caplog.at_level(logging.INFO, logger="crawl.crawlers.base"):
+        list(crawler.initial_sync())
+    msgs = [rec.getMessage() for rec in caplog.records]
+    assert any("initial_sync — 2 seed + 1 discovered → 3 unique slugs" in m for m in msgs)

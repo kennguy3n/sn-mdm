@@ -78,6 +78,13 @@ class PublisherStats:
     episodes_admitted: int = 0
     episodes_rejected_rights: int = 0
     episodes_skipped_dedup: int = 0
+    episodes_skipped_incremental: int = 0
+    """Slugs short-circuited before the HTTP fetch because their
+    canonical ``episode_id`` was already in the governance log.
+    Only non-zero when the pipeline was constructed with
+    ``incremental=True``. Distinct from
+    :attr:`episodes_skipped_dedup` (which fires *after* the
+    transcript fetch, on a ``content_hash`` collision)."""
     chunks_emitted: int = 0
 
 
@@ -94,6 +101,7 @@ class PipelineReport:
             out.episodes_admitted += s.episodes_admitted
             out.episodes_rejected_rights += s.episodes_rejected_rights
             out.episodes_skipped_dedup += s.episodes_skipped_dedup
+            out.episodes_skipped_incremental += s.episodes_skipped_incremental
             out.chunks_emitted += s.chunks_emitted
         return out
 
@@ -110,13 +118,34 @@ class Pipeline:
         configs: dict[str, CrawlerConfig],
         packs_root: Path,
         rights_allowlist: tuple[str, ...] = DEFAULT_RIGHTS_ALLOWLIST,
+        *,
+        incremental: bool = False,
     ) -> None:
         self.configs = configs
         self.packs_root = Path(packs_root)
         self.rights_allowlist = {code.lower() for code in rights_allowlist}
+        # ``incremental`` toggles between two episode-iteration
+        # strategies on the crawler side. In the default mode the
+        # pipeline calls :meth:`BaseCrawler.initial_sync` which
+        # fetches every discovered + seeded slug; the content-hash
+        # gate then short-circuits already-known episodes *after*
+        # the HTTP fetch. In incremental mode the pipeline calls
+        # :meth:`BaseCrawler.incremental_sync` with the set of
+        # known ``episode_id``s for that publisher (computed from
+        # the governance log), so the crawler can skip the fetch
+        # entirely. The two modes are equivalent in output
+        # (steady-state runs produce the same JSONL either way),
+        # but incremental drops the HTTP cost of re-fetching
+        # already-ingested episodes.
+        self.incremental = incremental
         # Map content_hash -> episode_id so re-crawls collapse on
         # already-seen content (third invariant from the research).
         self._seen_content_hashes: set[str] = set()
+        # Per-publisher set of ``episode_id``s admitted in some
+        # previous run. Only populated when ``incremental=True`` to
+        # avoid the governance-log re-read overhead on bootstrap
+        # runs. Lazily filled by :meth:`_known_ids_for`.
+        self._known_ids_by_publisher: dict[str, frozenset[str]] | None = None
         self._load_known_hashes()
 
     # -- public surface --------------------------------------------------
@@ -139,6 +168,10 @@ class Pipeline:
         crawler_cls = get_crawler(publisher_id)
         crawler = crawler_cls(config=config, packs_root=self.packs_root)
         stats = PublisherStats(publisher_id=publisher_id)
+        # Reset the per-crawler incremental counter so we read the
+        # count produced by *this* run, not a leftover from a prior
+        # incremental_sync() on the same crawler instance.
+        crawler.last_incremental_skip_count = 0
 
         metadata_path = crawler.open_jsonl("metadata")
         chunks_path = crawler.open_jsonl("chunks")
@@ -203,6 +236,13 @@ class Pipeline:
 
                 self._write_governance(gov_fp, crawler, normalised, deprecated=False)
                 stats.episodes_admitted += 1
+        # Read the incremental skip count the crawler accumulated
+        # during this run. In non-incremental mode the counter
+        # stays at 0 (we never call incremental_sync), so this is a
+        # cheap no-op for the default flow.
+        stats.episodes_skipped_incremental = getattr(
+            crawler, "last_incremental_skip_count", 0
+        )
         return stats
 
     # -- internals -------------------------------------------------------
@@ -212,10 +252,80 @@ class Pipeline:
         # deterministic across runs (the crawler's own generators
         # are deterministic but `list(...)` makes the contract
         # obvious in tracebacks).
-        episodes: list[RawEpisode] = []
-        for raw in crawler.initial_sync():
-            episodes.append(raw)
+        if self.incremental:
+            known = self._known_ids_for(crawler.publisher_id)
+            episodes = list(crawler.incremental_sync(known_episode_ids=known))
+        else:
+            episodes = list(crawler.initial_sync())
         return episodes
+
+    def _known_ids_for(self, publisher_id: str) -> frozenset[str]:
+        """Return the set of ``episode_id``s previously admitted
+        for ``publisher_id``.
+
+        Reads the governance log on first call and caches per-
+        publisher sets for the lifetime of the :class:`Pipeline`.
+        Only non-deprecated rows count — a rights-rejected episode
+        is *not* in the skip set because a future crawl could
+        legitimately re-admit it under a different rights code.
+        Membership is computed against the canonical episode_id
+        produced by :meth:`BaseCrawler.episode_id_for_slug`, which
+        is the same identifier the governance log writes.
+        """
+        if self._known_ids_by_publisher is None:
+            self._known_ids_by_publisher = self._load_known_episode_ids()
+        return self._known_ids_by_publisher.get(publisher_id, frozenset())
+
+    def _load_known_episode_ids(self) -> dict[str, frozenset[str]]:
+        """Walk the governance log once and group non-deprecated
+        ``episode_id``s by publisher.
+
+        The episode_id format is
+        ``{publisher_id}_{series_id}_{slug}`` — we partition by
+        prefix-matching every configured publisher_id so a
+        publisher_id that happens to contain underscores (none of
+        the current registry does, but the format permits it)
+        still groups correctly. We *do not* try to reverse-parse
+        the episode_id back into its components: that would
+        require knowing every publisher's series_id and is
+        unnecessary because the pipeline already has the
+        :class:`CrawlerConfig` registry to hand.
+        """
+        gov = self.packs_root / "governance" / "rights_log.jsonl"
+        per_publisher: dict[str, set[str]] = {pid: set() for pid in self.configs}
+        if not gov.exists():
+            return {pid: frozenset(s) for pid, s in per_publisher.items()}
+        # Pre-build a list of ``(publisher_id, prefix)`` pairs
+        # sorted by descending prefix length so a longer prefix
+        # (e.g. ``acquired_long_form_``) wins over a shorter one
+        # (e.g. ``acquired_``) on partition. Today no two
+        # registered publishers share a prefix, so the order
+        # doesn't matter; the sort is defence-in-depth for future
+        # additions.
+        prefixes = sorted(
+            ((pid, f"{pid}_") for pid in self.configs),
+            key=lambda kv: len(kv[1]),
+            reverse=True,
+        )
+        with gov.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("deprecated"):
+                    continue
+                ep_id = rec.get("episode_id")
+                if not isinstance(ep_id, str) or not ep_id:
+                    continue
+                for pid, prefix in prefixes:
+                    if ep_id.startswith(prefix):
+                        per_publisher[pid].add(ep_id)
+                        break
+        return {pid: frozenset(s) for pid, s in per_publisher.items()}
 
     def _rights_gate_allows(self, rights_code: str) -> bool:
         return rights_code.lower() in self.rights_allowlist
@@ -358,19 +468,36 @@ def main(argv: list[str] | None = None) -> int:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help=(
+            "Steady-state mode. Skip slugs whose canonical episode_id is "
+            "already present (non-deprecated) in the governance log, so the "
+            "crawler avoids re-fetching transcripts the pack already has. "
+            "Default mode runs the full discovery + transcript fetch loop and "
+            "relies on the content_hash gate to skip duplicates *after* the "
+            "HTTP fetch."
+        ),
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     configs = load_config(args.config)
-    pipeline = Pipeline(configs=configs, packs_root=args.packs_root)
+    pipeline = Pipeline(
+        configs=configs,
+        packs_root=args.packs_root,
+        incremental=args.incremental,
+    )
     report = pipeline.run(args.publishers or None)
     totals = report.totals()
     LOG.info(
-        "pipeline complete: %d seen, %d admitted, %d rejected, %d deduped, %d chunks",
+        "pipeline complete: %d seen, %d admitted, %d rejected, %d deduped, %d incremental-skipped, %d chunks",
         totals.episodes_seen,
         totals.episodes_admitted,
         totals.episodes_rejected_rights,
         totals.episodes_skipped_dedup,
+        totals.episodes_skipped_incremental,
         totals.chunks_emitted,
     )
     return exit_code_for(totals)
@@ -380,23 +507,26 @@ def exit_code_for(totals: PublisherStats) -> int:
     """Decide the CLI exit code from an aggregate :class:`PublisherStats`.
 
     Non-zero only when every publisher failed to admit anything *and*
-    the failure can't be explained by either the rights gate or the
-    content-hash dedup short-circuit. The pipeline is documented as
+    the failure can't be explained by any of the documented
+    short-circuits: the rights gate, the content-hash dedup gate,
+    or the incremental skip predicate. The pipeline is documented as
     idempotent — re-running on a packs root that already contains
     every episode will (correctly) admit nothing because every
     episode hashes to a ``content_hash`` that's already in the
-    governance log, and the run should succeed. Likewise a run that
-    only saw rights-rejected episodes is doing exactly what the gate
-    asked of it. Only return non-zero when *all three* explanations
-    are absent — that's the signal of a real crawl regression (e.g.
-    every source's HTML changed shape and parses to empty), not
-    normal steady-state.
+    governance log (default mode) or its ``episode_id`` is in the
+    incremental skip set (``--incremental`` mode). Likewise a run
+    that only saw rights-rejected episodes is doing exactly what
+    the gate asked of it. Only return non-zero when *all four*
+    explanations are absent — that's the signal of a real crawl
+    regression (e.g. every source's HTML changed shape and parses
+    to empty), not normal steady-state.
     """
     if (
         totals.episodes_seen > 0
         and totals.episodes_admitted == 0
         and totals.episodes_rejected_rights == 0
         and totals.episodes_skipped_dedup == 0
+        and totals.episodes_skipped_incremental == 0
     ):
         return 1
     return 0
