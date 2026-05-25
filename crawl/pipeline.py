@@ -153,9 +153,17 @@ class Pipeline:
             for raw in self._iter_episodes(crawler):
                 stats.episodes_seen += 1
                 # Rights gate — runs BEFORE normalisation so a
-                # rejected source is never even chunked. Keeps the
-                # contract identical to the Rust ``PackStore``.
-                gate_ok = self._rights_gate_allows(config.rights_code)
+                # rejected source is never even chunked. Prefers a
+                # per-episode override on the ``RawEpisode`` if the
+                # concrete crawler set one (one-off CC BY guest
+                # segment on an otherwise free-access feed, or a
+                # show-notes-only fallback that has different
+                # rights from the parent series); falls back to the
+                # publisher-level rights_code from the registry.
+                # Keeps the contract identical to the Rust
+                # ``PackStore``.
+                effective_rights = raw.rights_code or config.rights_code
+                gate_ok = self._rights_gate_allows(effective_rights)
                 if not gate_ok:
                     stats.episodes_rejected_rights += 1
                     normalised = self._best_effort_normalise(crawler, raw)

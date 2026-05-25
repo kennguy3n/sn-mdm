@@ -229,8 +229,11 @@ impl<'a> SearchEngine<'a> {
 
         // ---- Tag-only lane -----------------------------------------
         // When there's no FTS query, return chunks ordered by
-        // recency from the tag-matching episode set.
-        if query.text.trim().is_empty() && tags_active {
+        // recency from the tag-matching episode set. Skip entirely
+        // when the tag filter matched no episodes — otherwise we'd
+        // synthesize a `WHERE episode_id IN ()` clause, which SQLite
+        // rejects as a syntax error.
+        if query.text.trim().is_empty() && tags_active && !matching_episodes.is_empty() {
             let placeholders = std::iter::repeat_n("?", matching_episodes.len())
                 .collect::<Vec<_>>()
                 .join(",");
@@ -641,5 +644,48 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].chunk_id, "acquired_flagship_costco#0000");
         assert!(hits[0].semantic_score.unwrap() > hits[1].semantic_score.unwrap());
+    }
+
+    #[test]
+    fn tag_only_query_with_no_matches_returns_empty() {
+        // Regression: an earlier version generated `IN ()` SQL when
+        // the tag filter matched no episodes, which SQLite rejects
+        // with a syntax error.
+        let store = PackStore::open_in_memory().unwrap();
+        seed(&store);
+        let engine = SearchEngine::new(&store);
+        let hits = engine
+            .search(&SearchQuery {
+                text: "".into(),
+                tags: TagFilter {
+                    industry: vec!["industry-that-does-not-exist".into()],
+                    ..Default::default()
+                },
+                limit: 5,
+                ..Default::default()
+            })
+            .expect("should not error");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn fts_query_with_unmatched_tag_filter_returns_empty() {
+        // Regression: confirm the FTS lane also returns empty when
+        // the tag filter excludes everything.
+        let store = PackStore::open_in_memory().unwrap();
+        seed(&store);
+        let engine = SearchEngine::new(&store);
+        let hits = engine
+            .search(&SearchQuery {
+                text: "membership".into(),
+                tags: TagFilter {
+                    industry: vec!["industry-that-does-not-exist".into()],
+                    ..Default::default()
+                },
+                limit: 5,
+                ..Default::default()
+            })
+            .expect("should not error");
+        assert!(hits.is_empty());
     }
 }

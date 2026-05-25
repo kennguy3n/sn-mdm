@@ -160,18 +160,28 @@ machine-readably:
 ### `.pack` framing
 
 ```text
-+--------------------+
-| MAGIC ("SNMDM\x01") |  6 bytes
-+--------------------+
-| u32 manifest_len    |  4 bytes, little-endian
-+--------------------+
-|  MANIFEST (JSON)    |  manifest_len bytes
-+--------------------+
-| u32 db_len          |  4 bytes
-+--------------------+
-| zstd(sqlite db)     |  db_len bytes
-+--------------------+
++-----------------------+
+| MAGIC ("SNMDM")       |   5 bytes
++-----------------------+
+| u8 pack_format_version|   1 byte
++-----------------------+
+| u64 manifest_len      |   8 bytes, little-endian
++-----------------------+
+|  MANIFEST (JSON)      |   manifest_len bytes
++-----------------------+
+| u64 db_len            |   8 bytes
++-----------------------+
+| zstd(sqlite db)       |   db_len bytes
++-----------------------+
 ```
+
+The magic and version byte are split so a future v2 pack still
+presents the `SNMDM` magic and the reader can surface a more
+informative `UnsupportedPackVersion` error rather than a generic
+`BadMagic`. Length headers are `u64` so packs are not silently
+bounded to 4 GiB; the reader bounds-checks every header against
+the input buffer and returns `TruncatedPack` rather than
+panicking when a length exceeds the available bytes.
 
 The manifest contains:
 

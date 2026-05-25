@@ -141,6 +141,20 @@ class RawEpisode:
     summary: str = ""
     """Optional one-paragraph summary scraped from the page."""
 
+    rights_code: str | None = None
+    """Optional per-episode rights override. ``None`` falls back to
+    the publisher-level :attr:`CrawlerConfig.rights_code` from the
+    source registry. Crawlers set this when an individual episode
+    carries a different licence than the rest of the publisher's
+    catalogue (e.g. a one-off CC BY guest segment on an otherwise
+    free-access-copyrighted feed). The pipeline rights gate prefers
+    this value when present."""
+
+    rights_summary: str | None = None
+    """Optional per-episode rights summary string. ``None`` falls
+    back to the publisher-level :attr:`CrawlerConfig.rights_summary`.
+    Only meaningful when :attr:`rights_code` is also overridden."""
+
 
 @dataclass
 class NormalisedEpisode:
@@ -189,19 +203,28 @@ def canonicalise_text(s: str) -> str:
 
 def content_hash(text: str) -> str:
     """Return a stable hex digest used as the content-hash for
-    dedup. Uses BLAKE3 if the ``blake3`` package is available; falls
-    back to SHA-256 otherwise. The Rust ingest path always uses
-    BLAKE3, but the Python side may run on hosts without a C
-    toolchain — the digest is only used for in-process dedup, not
-    for cross-language hashing.
+    dedup.
+
+    The caller is responsible for passing already-canonicalised
+    text (see :func:`canonicalise_text`). This function does **not**
+    re-canonicalise — callers that need to hash raw input should
+    invoke ``content_hash(canonicalise_text(raw))`` explicitly. The
+    split keeps the hash cheap when the caller has already paid the
+    canonicalisation cost (the common case in
+    :meth:`BaseCrawler.normalize`).
+
+    Uses BLAKE3 if the ``blake3`` package is available; falls back
+    to SHA-256 otherwise. The Rust ingest path always uses BLAKE3,
+    but the Python side may run on hosts without a C toolchain —
+    the digest is only used for in-process dedup, not for
+    cross-language hashing.
     """
-    canonical = canonicalise_text(text)
     try:  # pragma: no cover - depends on optional install
         import blake3 as _blake3  # type: ignore[import-not-found]
 
-        return _blake3.blake3(canonical.encode("utf-8")).hexdigest()
+        return _blake3.blake3(text.encode("utf-8")).hexdigest()
     except ImportError:
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def count_tokens(text: str) -> int:
@@ -348,13 +371,20 @@ def chunk_normalised_text(
         if rendered_tokens > target_tokens:
             # Single very long turn — emit any pending buffer, then
             # split this turn into multiple chunks by hard word
-            # window.
+            # window. The window step already preserves overlap
+            # *between* the windows. After the last window, carry
+            # the trailing ``overlap_tokens`` words forward as the
+            # seed of the next buffer so the next speaker turn
+            # still overlaps with the tail of the long monologue
+            # — same invariant as :func:`_flush_chunk`.
             _flush_chunk()
             words = rendered.split()
             step = max(1, target_tokens - overlap_tokens)
+            last_window_words: list[str] = []
             for start in range(0, len(words), step):
                 end = min(len(words), start + target_tokens)
-                window = " ".join(words[start:end])
+                window_words = words[start:end]
+                window = " ".join(window_words)
                 chunks.append(
                     ChunkSpec(
                         chunk_index=len(chunks),
@@ -363,10 +393,16 @@ def chunk_normalised_text(
                         token_count=count_tokens(window),
                     )
                 )
+                last_window_words = window_words
                 if end >= len(words):
                     break
-            buffer = []
-            buffer_tokens = 0
+            if overlap_tokens > 0 and len(last_window_words) > overlap_tokens:
+                tail = last_window_words[-overlap_tokens:]
+                buffer = [" ".join(tail)]
+                buffer_tokens = len(tail)
+            else:
+                buffer = []
+                buffer_tokens = 0
             continue
 
         if buffer_tokens + rendered_tokens > target_tokens and buffer:
@@ -581,6 +617,8 @@ class BaseCrawler:
         else:
             text = self._normalize_html_bytes(raw.raw_bytes)
         canonical = canonicalise_text(text)
+        # ``content_hash`` no longer re-canonicalises — we pass the
+        # already-canonical text to keep the hash cheap.
         return NormalisedEpisode(
             raw=raw,
             normalised_markdown=canonical,
@@ -629,8 +667,8 @@ class BaseCrawler:
             "language": self.config.language,
             "primary_url": raw.primary_url,
             "asset_urls": raw.asset_urls,
-            "rights_code": self.config.rights_code,
-            "rights_summary": self.config.rights_summary,
+            "rights_code": raw.rights_code or self.config.rights_code,
+            "rights_summary": raw.rights_summary or self.config.rights_summary,
             "credibility_notes": self.config.credibility_notes,
             "summary": raw.summary,
             "chunking_policy": dict(self.config.chunking_policy),
@@ -668,7 +706,7 @@ class BaseCrawler:
         episode_id = f"{self.config.publisher_id}_{self.config.series_id}_{raw.episode_slug}"
         return {
             "episode_id": episode_id,
-            "rights_code": self.config.rights_code,
+            "rights_code": raw.rights_code or self.config.rights_code,
             "ingestion_date": int(time.time()),
             "content_hash": normalised.content_hash,
             "deprecated": deprecated,

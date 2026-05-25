@@ -5,18 +5,26 @@
 //! Layout:
 //!
 //! ```text
-//! +--------------------+
-//! |  MAGIC  ("SNMDM\x01") |  6  bytes
-//! +--------------------+
-//! | u32 manifest_len    |  4  bytes, little-endian
-//! +--------------------+
-//! |   MANIFEST (JSON)   |  manifest_len bytes
-//! +--------------------+
-//! |   u32 db_len        |  4  bytes, little-endian
-//! +--------------------+
-//! | zstd(SQLite db)     |  db_len bytes
-//! +--------------------+
+//! +-----------------------+
+//! | MAGIC ("SNMDM")       |   5 bytes
+//! +-----------------------+
+//! | u8 pack_format_version|   1 byte
+//! +-----------------------+
+//! | u64 manifest_len      |   8 bytes, little-endian
+//! +-----------------------+
+//! |   MANIFEST (JSON)     |   manifest_len bytes
+//! +-----------------------+
+//! | u64 db_len            |   8 bytes, little-endian
+//! +-----------------------+
+//! | zstd(SQLite db)       |   db_len bytes
+//! +-----------------------+
 //! ```
+//!
+//! The magic and the version byte are split: a future v2 pack will
+//! still present the `SNMDM` magic and surface a more informative
+//! [`PackError::UnsupportedPackVersion`] rather than the generic
+//! [`PackError::BadMagic`]. Length headers are `u64` so packs are
+//! not silently bounded to 4 GiB.
 //!
 //! The manifest carries:
 //!
@@ -44,9 +52,11 @@ use crate::ingest::PackStore;
 use crate::search::RankWeights;
 use crate::{PACK_MAGIC, SCHEMA_VERSION};
 
-/// Pack-file format version. Stamped onto every `.pack` manifest.
-/// Independent of [`SCHEMA_VERSION`] — bumped only when the
-/// framing layout itself changes.
+/// Pack-file format version. Stamped onto every `.pack` manifest
+/// and written immediately after the [`PACK_MAGIC`] bytes in the
+/// file header. Independent of [`SCHEMA_VERSION`] — bumped only
+/// when the framing layout itself changes (e.g. a new section is
+/// added after the SQLite blob).
 pub const PACK_FORMAT_VERSION: u8 = 1;
 
 /// Default zstd compression level for the SQLite blob. Level 19 hits
@@ -184,13 +194,17 @@ impl<'a> PackBuilder<'a> {
     pub fn build_to<P: AsRef<Path>>(&self, output_path: P) -> Result<PackManifest> {
         let path = output_path.as_ref();
 
-        // 1. VACUUM INTO a temp file so we get a clean snapshot.
-        let tmp = tempfile::Builder::new()
-            .prefix("sn-mdm-pack-")
-            .suffix(".sqlite")
-            .tempfile()?;
-        let tmp_path = tmp.path().to_path_buf();
-        drop(tmp); // close handle so VACUUM INTO can open it.
+        // 1. VACUUM INTO a child of a private tempdir. The tempdir
+        //    is owned for the duration of this call (its `Drop` cleans
+        //    the directory and everything inside it on success or
+        //    panic), and we hand SQLite a *non-existent* path inside
+        //    that directory so there's no race window where another
+        //    process could reclaim the inode between `drop(tmp)` and
+        //    `VACUUM INTO`. The directory mode is the OS default for
+        //    `mkdtemp` (0700 on Unix), so a sibling process can't
+        //    plant a symlink at the chosen path either.
+        let tmp_dir = tempfile::Builder::new().prefix("sn-mdm-pack-").tempdir()?;
+        let tmp_path = tmp_dir.path().join("snapshot.sqlite");
 
         let escaped = tmp_path.to_string_lossy().replace('\'', "''");
         self.store
@@ -201,7 +215,7 @@ impl<'a> PackBuilder<'a> {
         let mut raw_db = Vec::new();
         File::open(&tmp_path)?.read_to_end(&mut raw_db)?;
         let compressed = zstd::stream::encode_all(std::io::Cursor::new(&raw_db), self.zstd_level)?;
-        let _ = std::fs::remove_file(&tmp_path);
+        drop(tmp_dir); // best-effort cleanup; tempdir Drop also unlinks.
 
         // 3. Build the manifest.
         let publishers = self.collect_publisher_manifests()?;
@@ -222,12 +236,14 @@ impl<'a> PackBuilder<'a> {
         };
         let manifest_bytes = serde_json::to_vec(&manifest)?;
 
-        // 4. Write the framed pack.
+        // 4. Write the framed pack. Lengths are `u64` so packs are
+        //    not silently bounded to 4 GiB.
         let mut out = std::fs::File::create(path)?;
         out.write_all(&PACK_MAGIC)?;
-        out.write_all(&(manifest_bytes.len() as u32).to_le_bytes())?;
+        out.write_all(&[PACK_FORMAT_VERSION])?;
+        out.write_all(&(manifest_bytes.len() as u64).to_le_bytes())?;
         out.write_all(&manifest_bytes)?;
-        out.write_all(&(compressed.len() as u32).to_le_bytes())?;
+        out.write_all(&(compressed.len() as u64).to_le_bytes())?;
         out.write_all(&compressed)?;
         out.flush()?;
         Ok(manifest)
@@ -280,31 +296,43 @@ impl PackReader {
     }
 
     /// Parse and verify an in-memory pack blob.
+    ///
+    /// Every byte read from `bytes` is bounds-checked. A length
+    /// header that does not fit within the buffer surfaces as
+    /// [`PackError::TruncatedPack`] (with the failing field name
+    /// and offsets) rather than panicking. Magic / version / schema
+    /// / checksum mismatches all surface as their respective
+    /// [`PackError`] variants.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        if bytes.len() < PACK_MAGIC.len() + 4 {
-            return Err(PackError::BadMagic);
+        // Minimum framing: magic (5) + version (1) + manifest_len
+        // (8) + db_len (8) = 22 bytes. A pack smaller than that is
+        // structurally invalid.
+        const MIN_HEADER_BYTES: usize = PACK_MAGIC.len() + 1 + 8 + 8;
+        if bytes.len() < MIN_HEADER_BYTES {
+            return Err(PackError::TruncatedPack {
+                field: "header",
+                offset: 0,
+                needed: MIN_HEADER_BYTES,
+                available: bytes.len(),
+            });
         }
         if bytes[..PACK_MAGIC.len()] != PACK_MAGIC {
             return Err(PackError::BadMagic);
         }
-        let format_version = bytes[PACK_MAGIC.len() - 1];
+        let format_version = bytes[PACK_MAGIC.len()];
         if format_version != PACK_FORMAT_VERSION {
             return Err(PackError::UnsupportedPackVersion {
                 found: format_version,
             });
         }
 
-        let mut cursor = PACK_MAGIC.len();
-        let manifest_len =
-            u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let manifest_bytes = &bytes[cursor..cursor + manifest_len];
-        cursor += manifest_len;
+        let mut cursor = PACK_MAGIC.len() + 1;
+        let manifest_len = read_u64_field(&bytes, &mut cursor, "manifest_len")?;
+        let manifest_bytes = read_slice(&bytes, &mut cursor, manifest_len, "manifest")?;
         let manifest: PackManifest = serde_json::from_slice(manifest_bytes)?;
 
-        let db_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let compressed_db = bytes[cursor..cursor + db_len].to_vec();
+        let db_len = read_u64_field(&bytes, &mut cursor, "db_len")?;
+        let compressed_db = read_slice(&bytes, &mut cursor, db_len, "db_blob")?.to_vec();
 
         // Manifest checksum.
         let computed = blake3::hash(&compressed_db).to_hex().to_string();
@@ -337,6 +365,67 @@ impl PackReader {
         std::fs::write(path, decompressed)?;
         Ok(())
     }
+}
+
+/// Read a little-endian `u64` length field from `bytes[*cursor..*cursor + 8]`
+/// and advance `*cursor`. Returns [`PackError::TruncatedPack`] if the
+/// 8-byte window does not fit within `bytes`. The returned `usize`
+/// is the length the caller can pass straight to [`read_slice`] on
+/// 64-bit platforms; on 32-bit platforms we additionally guard
+/// against the `usize` cast truncating a value that wouldn't fit
+/// in `usize::MAX` anyway.
+fn read_u64_field(bytes: &[u8], cursor: &mut usize, field: &'static str) -> Result<usize> {
+    let end = cursor.checked_add(8).ok_or(PackError::TruncatedPack {
+        field,
+        offset: *cursor,
+        needed: 8,
+        available: bytes.len().saturating_sub(*cursor),
+    })?;
+    if end > bytes.len() {
+        return Err(PackError::TruncatedPack {
+            field,
+            offset: *cursor,
+            needed: 8,
+            available: bytes.len().saturating_sub(*cursor),
+        });
+    }
+    let value = u64::from_le_bytes(bytes[*cursor..end].try_into().unwrap());
+    *cursor = end;
+    usize::try_from(value).map_err(|_| PackError::TruncatedPack {
+        field,
+        offset: end,
+        needed: usize::MAX, // value doesn't fit in usize on this target
+        available: bytes.len().saturating_sub(end),
+    })
+}
+
+/// Take `len` bytes from `bytes[*cursor..]` and advance `*cursor`.
+/// Returns [`PackError::TruncatedPack`] if the requested window
+/// does not fit within `bytes`. Pure bounds-checking; the caller
+/// is responsible for treating the borrowed slice as valid input.
+fn read_slice<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+    field: &'static str,
+) -> Result<&'a [u8]> {
+    let end = cursor.checked_add(len).ok_or(PackError::TruncatedPack {
+        field,
+        offset: *cursor,
+        needed: len,
+        available: bytes.len().saturating_sub(*cursor),
+    })?;
+    if end > bytes.len() {
+        return Err(PackError::TruncatedPack {
+            field,
+            offset: *cursor,
+            needed: len,
+            available: bytes.len().saturating_sub(*cursor),
+        });
+    }
+    let out = &bytes[*cursor..end];
+    *cursor = end;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -438,6 +527,61 @@ mod tests {
         match PackReader::open(&pack_path) {
             Err(PackError::ChecksumMismatch { .. }) => {}
             other => panic!("expected checksum error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_input_does_not_panic() {
+        // Empty input — below minimum header size.
+        match PackReader::from_bytes(Vec::new()) {
+            Err(PackError::TruncatedPack { field, .. }) => assert_eq!(field, "header"),
+            other => panic!("expected truncated-pack error, got {other:?}"),
+        }
+        // Magic-only — below minimum header size.
+        match PackReader::from_bytes(b"SNMDM".to_vec()) {
+            Err(PackError::TruncatedPack { field, .. }) => assert_eq!(field, "header"),
+            other => panic!("expected truncated-pack error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_length_header_returns_truncated_error() {
+        // Build a header that claims an absurd manifest length.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&PACK_MAGIC);
+        bytes.push(PACK_FORMAT_VERSION);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // manifest_len = u64::MAX
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // db_len = 0
+        match PackReader::from_bytes(bytes) {
+            Err(PackError::TruncatedPack { field, .. }) => assert_eq!(field, "manifest"),
+            other => panic!("expected truncated-pack error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bad_magic_is_detected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"BADMG"); // 5 bytes != SNMDM
+        bytes.push(PACK_FORMAT_VERSION);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        match PackReader::from_bytes(bytes) {
+            Err(PackError::BadMagic) => {}
+            other => panic!("expected bad-magic error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_version_is_detected() {
+        // Same magic, but version byte = 99 (future format).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&PACK_MAGIC);
+        bytes.push(99);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        match PackReader::from_bytes(bytes) {
+            Err(PackError::UnsupportedPackVersion { found }) => assert_eq!(found, 99),
+            other => panic!("expected unsupported-version error, got {other:?}"),
         }
     }
 }

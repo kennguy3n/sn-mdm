@@ -30,13 +30,27 @@ pub enum PackError {
     IncompatibleSchema { found: i32, expected: i32 },
 
     /// `.pack` file header did not start with [`crate::PACK_MAGIC`].
-    #[error("pack header magic mismatch (expected SNMDM\\x01)")]
+    #[error("pack header magic mismatch (expected SNMDM)")]
     BadMagic,
 
     /// `.pack` file declared a pack-format version this binary does
     /// not understand.
     #[error("unsupported pack format version: {found}")]
     UnsupportedPackVersion { found: u8 },
+
+    /// `.pack` file was truncated or declared a length header that
+    /// does not fit within the actual byte buffer. Returned by
+    /// [`crate::export::PackReader::from_bytes`] when a length
+    /// header points past the end of the input.
+    #[error(
+        "truncated pack: needed {needed} bytes for {field} at offset {offset}, have {available}"
+    )]
+    TruncatedPack {
+        field: &'static str,
+        offset: usize,
+        needed: usize,
+        available: usize,
+    },
 
     /// `.pack` file's BLAKE3 manifest checksum did not match the
     /// computed value over its contents.

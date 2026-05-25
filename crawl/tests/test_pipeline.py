@@ -167,4 +167,65 @@ def test_default_rights_allowlist_mirrors_pack_core() -> None:
     assert "ogl_v3" in DEFAULT_RIGHTS_ALLOWLIST
     assert "cc_by_nc_nd" in DEFAULT_RIGHTS_ALLOWLIST
     assert "free_access_copyrighted" in DEFAULT_RIGHTS_ALLOWLIST
+
+
+class PerEpisodeRightsCrawler(FakeCrawler):
+    """Fake crawler that overrides the rights code on a per-episode
+    basis via ``RawEpisode.rights_code``. Used to exercise the
+    defense-in-depth rights gate.
+    """
+
+    def initial_sync(self):
+        # Two episodes:
+        #   - "allowed" piggybacks on a CC BY override even though
+        #     the publisher-level code below is paywalled,
+        #   - "rejected" leaves the override empty so the rejected
+        #     publisher-level code applies.
+        yield RawEpisode(
+            episode_slug="allowed",
+            title="Allowed",
+            primary_url="https://example.com/episodes/allowed",
+            publication_date="2024-01-01",
+            raw_bytes=b"<html><body><p>SIMON: hi</p></body></html>",
+            content_type="text/html",
+            hosts=["Simon"],
+            rights_code="cc_by",
+            rights_summary="One-off CC BY guest segment.",
+        )
+        yield RawEpisode(
+            episode_slug="rejected",
+            title="Rejected",
+            primary_url="https://example.com/episodes/rejected",
+            publication_date="2024-01-02",
+            raw_bytes=b"<html><body><p>SIMON: hi</p></body></html>",
+            content_type="text/html",
+            hosts=["Simon"],
+        )
+
+
+def test_per_episode_rights_override_admits_when_publisher_blocks(
+    tmp_path: Path,
+) -> None:
+    from crawl import crawlers
+
+    crawlers._REGISTRY["fake"] = PerEpisodeRightsCrawler  # type: ignore[attr-defined]
+    pipeline = Pipeline(
+        configs={"fake": _config("paywalled")},  # publisher-level: blocked
+        packs_root=tmp_path,
+    )
+    report = pipeline.run(["fake"])
+    stats = report.by_publisher["fake"]
+    # One episode admitted (cc_by override), one rejected (no
+    # override, publisher-level paywalled).
+    assert stats.episodes_seen == 2
+    assert stats.episodes_admitted == 1
+    assert stats.episodes_rejected_rights == 1
+    # Metadata line for the admitted episode must carry the
+    # per-episode rights code, not the publisher-level one.
+    metadata = (tmp_path / "metadata" / "fake.jsonl").read_text().strip().splitlines()
+    assert len(metadata) == 1
+    parsed = json.loads(metadata[0])
+    assert parsed["episode_id"].endswith("_allowed")
+    assert parsed["rights_code"] == "cc_by"
+    assert parsed["rights_summary"] == "One-off CC BY guest segment."
     assert "paywalled" not in DEFAULT_RIGHTS_ALLOWLIST

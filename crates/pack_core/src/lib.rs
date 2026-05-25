@@ -53,9 +53,12 @@ pub use search::{RankWeights, SearchEngine, SearchHit, SearchQuery, SearchScope}
 ///   with `unicode61 remove_diacritics 2`).
 pub const SCHEMA_VERSION: i32 = 1;
 
-/// Canonical pack-format magic header — `b"SNMDM\x01"`. Written as
-/// the first 6 bytes of every `.pack` file. The trailing byte is the
-/// pack-format version (`0x01` today); bumped if the framing layout
-/// itself changes (separate from [`SCHEMA_VERSION`], which tracks
-/// the SQLite schema inside the pack).
-pub const PACK_MAGIC: [u8; 6] = *b"SNMDM\x01";
+/// Canonical pack-format magic header — `b"SNMDM"`. Written as the
+/// first 5 bytes of every `.pack` file. Immediately followed on disk
+/// by a single `u8` pack-format version byte (see
+/// [`export::PACK_FORMAT_VERSION`]); split out from the magic so a
+/// future pack with a bumped framing version still presents the same
+/// magic prefix and returns the more informative
+/// [`PackError::UnsupportedPackVersion`] rather than the generic
+/// [`PackError::BadMagic`].
+pub const PACK_MAGIC: [u8; 5] = *b"SNMDM";
