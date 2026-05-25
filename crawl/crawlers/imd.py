@@ -4,8 +4,13 @@ IMD publishes podcasts under
 ``https://www.imd.org/ibyimd/podcasts/{slug}`` (the public
 permalink). The ``/ibyimd/category/podcasts/`` index page lists
 every episode and we walk that to enumerate slugs. The site
-follows a standard WordPress layout — body text inside
-``<article>``, header inside ``<header>``.
+runs on WordPress with the Elementor page builder: the post
+body lives inside ``<div data-elementor-type="wp-post">`` and
+several related-articles ``<article class="card">`` widgets are
+rendered as siblings of (and inside) that container. See
+:meth:`ImdCrawler._normalize_html_bytes` for the extraction
+strategy that pins to the Elementor marker and strips the
+``article.card`` widgets in the fallback path.
 
 Some episodes live under a series prefix like
 ``ibyimd/podcasts/leaders-unplugged/<slug>``. The discovery
@@ -95,10 +100,61 @@ class ImdCrawler(BaseCrawler):
         )
 
     def _normalize_html_bytes(self, raw_bytes: bytes) -> str:
+        """Lift the canonical episode body out of IMD's Elementor layout.
+
+        IMD wraps the post body in
+        ``<div data-elementor-type="wp-post">``, but the same
+        template also ships several ``<article>`` blocks for the
+        "Related Articles" sidebar widget that render *outside*
+        the wp-post container at the top of the DOM. The original
+        Tranche-1 implementation picked ``soup.find("article")``,
+        which selects the first ``<article>``; that's the related-
+        cards widget, not the episode body. Every episode page
+        on the site renders the same recent-articles list there,
+        so the extracted text was effectively identical across
+        every episode — the content-hash dedup gate then folded
+        22 of the 25 discovered episodes into one row.
+
+        Pinning to ``data-elementor-type="wp-post"`` is the
+        canonical fix: that attribute is Elementor's marker for
+        the post-content wrapper and the only one IMD renders per
+        page.
+
+        Two related-cards strip strategies, chosen by whether we
+        successfully pinned to the wp-post container:
+
+        * **Pinned**: inside the wp-post container, blanket-strip
+          any nested ``<article>`` blocks. Those are the in-body
+          "you might also like" widget; the actual post body
+          rendered by Elementor is never an ``<article>``, so a
+          blanket strip is safe and forward-compatible.
+
+        * **Fallback** (wp-post marker missing): the related-
+          cards widget on IMD always renders ``class="card"``
+          on each article (sometimes alongside other class
+          tokens, never substring-merged into compound words
+          like ``flashcard``). The class-list selector
+          ``article.card`` matches any article whose class
+          *list* contains ``card`` — including compound classes
+          such as ``"card related"`` — without false-positives
+          on unrelated names like ``"flashcard"``. A future IMD
+          layout that puts the episode body inside a bare HTML5
+          ``<article>`` therefore survives the fallback — we'd
+          rather ship a noisy episode than silently drop the
+          body.
+        """
         soup = BeautifulSoup(raw_bytes, "lxml")
         for tag in soup(["script", "style", "noscript", "iframe", "nav", "footer", "header"]):
             tag.decompose()
-        container = soup.find("article") or soup
+        post = soup.find("div", attrs={"data-elementor-type": "wp-post"})
+        if post is not None:
+            container = post
+            for art in container.find_all("article"):
+                art.decompose()
+        else:
+            container = soup
+            for art in container.select("article.card"):
+                art.decompose()
         for level in range(1, 7):
             for h in container.find_all(f"h{level}"):
                 h.replace_with(f"\n{'#' * level} {h.get_text(strip=True)}\n")

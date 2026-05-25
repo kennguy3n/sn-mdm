@@ -22,6 +22,13 @@ _EPISODE_SITEMAP_URL = "https://mastersofscale.com/episode-sitemap.xml"
 _EPISODE_LOC_RE = re.compile(
     r"<loc>\s*https?://mastersofscale\.com/episode/([a-z0-9][a-z0-9\-]*)/?\s*</loc>"
 )
+# Heading-tag matchers used by :meth:`MastersOfScaleCrawler._normalize_html_bytes`.
+# Lifted to module scope to match the convention used by other crawlers
+# (e.g. ``imd._HREF_RE``) and to avoid re-compiling on every page render.
+_HEADING_RE = re.compile(r"^h[1-6]$")
+_TRANSCRIPT_ANCHOR_RE = re.compile(r"^transcript\b")
+_TOP_HEADING_RE = re.compile(r"^h[1-2]$")
+_SUB_HEADING_RE = re.compile(r"^h[3-6]$")
 
 
 class MastersOfScaleCrawler(BaseCrawler):
@@ -73,28 +80,99 @@ class MastersOfScaleCrawler(BaseCrawler):
         )
 
     def _normalize_html_bytes(self, raw_bytes: bytes) -> str:
+        """Lift the verbatim transcript out of the Masters of Scale page.
+
+        MoS pages introduce the transcript with an ``<h2>`` whose
+        text starts with ``Transcript:``. The original Tranche-1
+        implementation walked ``target.next_siblings`` to collect
+        the transcript paragraphs — but the heading is nested
+        inside a sticky wrapper ``<div class="flex md:block …">``
+        that holds an "Open / Close" chevron toggle. The only
+        direct sibling of the heading inside that wrapper is the
+        chevron-toggle ``<div>``; the actual ``<p>`` paragraphs of
+        the transcript are siblings of that wrapper, one level
+        up. The previous behaviour therefore extracted exactly the
+        chevron-toggle text ("Open chevron-down Close chevron-up")
+        — identical across every episode page — and the content-
+        hash dedup gate folded 24 of the 25 discovered episodes
+        into one admitted row.
+
+        The architecturally correct walk is :meth:`find_all_next`,
+        which descends the entire forward DOM from the heading,
+        capturing every ``<p>``, ``<li>`` and ``<blockquote>``
+        regardless of which wrapper ``<div>`` they sit inside.
+        We stop at the next top-level heading (``h1``/``h2``); on
+        MoS pages there's no such heading after the transcript,
+        so the walk runs to end-of-(content-)DOM. The ``nav`` /
+        ``footer`` / ``header`` / ``iframe`` / ``script`` strip
+        already ran above, so trailing site-chrome paragraphs
+        ("Sign up for the newsletter…") aren't in scope.
+
+        Episodes published before MoS started shipping
+        transcripts return an empty string from this method.
+        ``_collapse_blank_lines("")`` is the empty string, every
+        such episode therefore lands in the same dedup bucket
+        instead of polluting the catalogue with one "header-only"
+        row per audio-only show — which is what we want.
+
+        Two further defences-in-depth:
+
+        * Captured candidates are tracked by ``id()`` and any
+          descendant of a previously-captured candidate is
+          skipped — otherwise a transcript paragraph wrapped in
+          a ``<blockquote>`` would emit twice (once for the
+          blockquote and once for the inner ``<p>``) and inflate
+          the dedup key.
+
+        * Structural sub-headings (``h3``-``h6``) inside the
+          transcript section are rendered as markdown headings so
+          the chunker can use them as section boundaries. Only
+          ``h1``/``h2`` are stop conditions; they bound the
+          transcript section, not its body.
+        """
         soup = BeautifulSoup(raw_bytes, "lxml")
         for tag in soup(["script", "style", "noscript", "iframe", "nav", "footer", "header"]):
             tag.decompose()
-        # Match a heading whose text contains "Transcript" and collect siblings.
+        # Only headings that *start with* the word "Transcript"
+        # qualify — bare ``"transcript" in text.lower()`` would
+        # also match titles like "An older episode without a
+        # transcript", which is the wrong anchor and would emit
+        # the page chrome as a "transcript" for audio-only shows.
         target = None
-        for h in soup.find_all(re.compile(r"^h[1-6]$")):
-            if "transcript" in h.get_text(" ", strip=True).lower():
+        for h in soup.find_all(_HEADING_RE):
+            text = h.get_text(" ", strip=True).lower()
+            if _TRANSCRIPT_ANCHOR_RE.match(text):
                 target = h
                 break
         if target is None:
-            container = soup.find("article") or soup
-        else:
-            container = soup.new_tag("div")
-            for sib in list(target.next_siblings):
-                if getattr(sib, "name", None) and re.match(r"^h[1-2]$", sib.name):
-                    break
-                if hasattr(sib, "extract"):
-                    container.append(sib.extract())
-        for level in range(1, 7):
-            for h in container.find_all(f"h{level}"):
-                h.replace_with(f"\n{'#' * level} {h.get_text(strip=True)}\n")
-        return _collapse_blank_lines(container.get_text("\n"))
+            return ""
+        blocks: list[str] = []
+        captured_ids: set[int] = set()
+        for sib in target.find_all_next():
+            name = getattr(sib, "name", None)
+            if name is None:
+                continue
+            if _TOP_HEADING_RE.match(name):
+                break
+            # Skip descendants of an element we already emitted —
+            # otherwise ``<blockquote><p>X</p></blockquote>``
+            # yields X twice. ``parents`` iterates from immediate
+            # parent up to the document root.
+            if any(id(ancestor) in captured_ids for ancestor in sib.parents):
+                continue
+            if name in ("p", "li", "blockquote"):
+                text = sib.get_text(" ", strip=True)
+                if text:
+                    blocks.append(text)
+                    captured_ids.add(id(sib))
+                continue
+            if _SUB_HEADING_RE.match(name):
+                text = sib.get_text(" ", strip=True)
+                if text:
+                    level = int(name[1])
+                    blocks.append(f"{'#' * level} {text}")
+                    captured_ids.add(id(sib))
+        return _collapse_blank_lines("\n\n".join(blocks))
 
 
 def _meta_description(soup: BeautifulSoup) -> str:
