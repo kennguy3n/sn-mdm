@@ -1,0 +1,28 @@
+/target
+Cargo.lock.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Crawl outputs (large, regenerated)
+packs/raw/**/*
+packs/normalized/**/*
+packs/metadata/**/*
+packs/chunks/**/*
+packs/governance/**/*
+!packs/**/.gitkeep
+
+# Built pack artifacts
+*.pack
+*.pack.idx
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

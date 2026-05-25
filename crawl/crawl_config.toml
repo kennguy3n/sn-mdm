@@ -1,0 +1,416 @@
+# sn-mdm source registry.
+#
+# Each [sources.<publisher_id>] section configures one crawler. The
+# `publisher_id` must match a class registered in
+# `crawl/crawlers/__init__.py::_REGISTRY` — running the pipeline
+# raises if a section references an unknown publisher.
+#
+# Slugs in `episodes` are the per-source path component the crawler
+# turns into a fetch URL (see `_episode_url` on each crawler class).
+# This list is the **seed set** — concrete crawlers may expand the
+# list during `initial_sync` by crawling the source's index page.
+#
+# Tag families follow the 5-family taxonomy from `docs/SOURCES.md`:
+# industry / function / business_model / geography / evidence_type.
+#
+# Default chunking_policy lives on every section so a per-source
+# override is local. Operators bumping the global default should
+# also update `DEFAULT_TARGET_TOKENS` / `DEFAULT_OVERLAP_TOKENS`
+# in `crawl/crawlers/base.py` and `pack_core::metadata::DEFAULT_CHUNKING`.
+
+# --- Tranche 1: core sources --------------------------------------
+
+[sources.acquired]
+publisher_name        = "Acquired"
+base_url              = "https://www.acquired.fm/episodes"
+host                  = "Ben Gilbert"
+series_id             = "flagship"
+series_title          = "Acquired"
+primary_series_url    = "https://www.acquired.fm/episodes"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; transcripts published on official site."
+country_region        = ["US", "global"]
+industry_tags         = ["retail", "consumer", "tech", "healthcare", "media"]
+function_tags         = ["strategy", "M&A", "operations"]
+business_model_tags   = ["B2B", "B2C", "platform"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "Long-form first-party deep dives; widely cited."
+episodes = [
+  "costco",
+  "ikea",
+  "novo-nordisk-and-ozempic",
+  "indian-premier-league-cricket",
+]
+
+[sources.acquired.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.a16z]
+publisher_name        = "Andreessen Horowitz"
+base_url              = "https://a16z.com/podcast"
+host                  = "Marc Andreessen"
+series_id             = "flagship"
+series_title          = "a16z Podcast"
+primary_series_url    = "https://a16z.com/podcast"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; full episodes + dense show-note summaries published on a16z.com."
+country_region        = ["US", "global"]
+industry_tags         = ["tech", "fintech", "ai", "healthcare", "consumer"]
+function_tags         = ["strategy", "GTM", "performance-marketing", "M&A"]
+business_model_tags   = ["B2B", "B2C", "venture-backed", "SaaS", "platform"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party VC publisher; long-form interviews + show-note essays."
+episodes = []
+
+[sources.a16z.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.bcg]
+publisher_name        = "BCG"
+base_url              = "https://www.bcg.com/featured-insights/podcasts"
+host                  = ""
+series_id             = "featured_insights"
+series_title          = "BCG Featured Insights"
+primary_series_url    = "https://www.bcg.com/featured-insights/podcasts"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; transcripts shipped as PDFs on web-assets.bcg.com."
+country_region        = ["global", "US", "Germany", "Switzerland"]
+industry_tags         = ["consulting", "healthcare", "finance", "retail", "energy"]
+function_tags         = ["strategy", "operations", "M&A", "cyber-risk"]
+business_model_tags   = ["B2B", "regulated-incumbent", "public-sector"]
+source_type           = "podcast_transcript_pdf"
+language              = "en"
+credibility_notes     = "First-party consulting publisher; PDF transcripts for most episodes."
+episodes = []
+
+[sources.bcg.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.mckinsey]
+publisher_name        = "McKinsey & Company"
+base_url              = "https://www.mckinsey.com"
+host                  = ""
+series_id             = "insights"
+series_title          = "McKinsey Insights"
+primary_series_url    = "https://www.mckinsey.com/featured-insights"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; verbatim transcripts inside Insights / Capabilities / Industries posts."
+country_region        = ["global", "US", "UK", "GCC", "Saudi Arabia", "UAE", "APAC"]
+industry_tags         = ["consulting", "finance", "healthcare", "retail", "energy", "tech"]
+function_tags         = ["strategy", "operations", "M&A", "performance-marketing", "compliance"]
+business_model_tags   = ["B2B", "regulated-incumbent", "public-sector"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party consulting publisher; transcripts inside Insights pages."
+episodes = []
+
+[sources.mckinsey.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.exit_five]
+publisher_name        = "Exit Five"
+base_url              = "https://www.exitfive.com/podcast"
+host                  = "Dan Murphy"
+series_id             = "flagship"
+series_title          = "Exit Five"
+primary_series_url    = "https://www.exitfive.com/podcast"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; transcription sections under each episode page."
+country_region        = ["US", "global"]
+industry_tags         = ["marketing"]
+function_tags         = ["GTM", "performance-marketing", "strategy"]
+business_model_tags   = ["B2B", "SaaS"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "B2B marketing community; transcripts on episode pages."
+episodes = []
+
+[sources.exit_five.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.ted_worklife]
+publisher_name        = "TED"
+base_url              = "https://www.ted.com/podcasts/worklife"
+host                  = "Adam Grant"
+series_id             = "worklife"
+series_title          = "WorkLife with Adam Grant"
+primary_series_url    = "https://www.ted.com/podcasts/worklife"
+rights_code           = "cc_by_nc_nd"
+rights_summary        = "CC BY-NC-ND 4.0; full transcripts published on ted.com under the WorkLife show."
+country_region        = ["US", "global"]
+industry_tags         = ["HR", "leadership"]
+function_tags         = ["culture", "hiring", "operations"]
+business_model_tags   = ["B2B", "public-sector"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "TED-curated; CC BY-NC-ND, attribution preserved on every chunk."
+episodes = []
+
+[sources.ted_worklife.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.masters_of_scale]
+publisher_name        = "Masters of Scale"
+base_url              = "https://mastersofscale.com/episode"
+host                  = "Reid Hoffman"
+series_id             = "flagship"
+series_title          = "Masters of Scale"
+primary_series_url    = "https://mastersofscale.com/episodes"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; full transcripts on episode pages."
+country_region        = ["US", "global"]
+industry_tags         = ["tech", "retail", "consumer", "ai"]
+function_tags         = ["strategy", "GTM", "hiring", "culture"]
+business_model_tags   = ["B2B", "B2C", "venture-backed", "platform"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party publisher; verified transcripts."
+episodes = []
+
+[sources.masters_of_scale.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.people_matters]
+publisher_name        = "People Matters"
+base_url              = "https://www.peoplematters.in/podcast"
+host                  = ""
+series_id             = "flagship"
+series_title          = "People Matters Podcast"
+primary_series_url    = "https://www.peoplematters.in/podcast"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; podcast pages on peoplematters.in (India / SEA)."
+country_region        = ["India", "Singapore", "Indonesia", "APAC"]
+industry_tags         = ["HR"]
+function_tags         = ["hiring", "culture", "compensation"]
+business_model_tags   = ["B2B", "regulated-incumbent"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "Regional APAC HR publisher with first-party transcripts."
+episodes = []
+
+[sources.people_matters.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.rbc_disruptors]
+publisher_name        = "RBC Disruptors"
+base_url              = "https://www.rbc.com/en/thought-leadership/disruptors"
+host                  = "John Stackhouse"
+series_id             = "flagship"
+series_title          = "RBC Disruptors"
+primary_series_url    = "https://www.rbc.com/en/thought-leadership/disruptors"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; audio transcripts published on rbc.com."
+country_region        = ["Canada", "global"]
+industry_tags         = ["banking", "finance"]
+function_tags         = ["strategy", "M&A", "innovation"]
+business_model_tags   = ["B2B", "regulated-incumbent"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party publisher (Canadian bank)."
+episodes = []
+
+[sources.rbc_disruptors.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.imd]
+publisher_name        = "IMD Business School"
+base_url              = "https://www.imd.org/ibyimd/category/podcasts"
+host                  = ""
+series_id             = "ibyimd"
+series_title          = "I by IMD Podcasts"
+primary_series_url    = "https://www.imd.org/ibyimd/category/podcasts"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; transcripts on the I by IMD blog."
+country_region        = ["Switzerland", "global"]
+industry_tags         = ["consulting", "leadership"]
+function_tags         = ["strategy", "operations", "culture"]
+business_model_tags   = ["B2B", "regulated-incumbent"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party business school publisher."
+episodes = []
+
+[sources.imd.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.wef_radio_davos]
+publisher_name        = "World Economic Forum"
+base_url              = "https://www.weforum.org/podcasts/radio-davos/episodes"
+host                  = "Robin Pomeroy"
+series_id             = "radio_davos"
+series_title          = "Radio Davos"
+primary_series_url    = "https://www.weforum.org/podcasts/radio-davos"
+rights_code           = "cc_by_nc_nd"
+rights_summary        = "WEF CC BY-NC-ND-style license; auto-generated transcripts published on weforum.org."
+country_region        = ["global", "Switzerland"]
+industry_tags         = ["policy", "energy", "ai", "healthcare"]
+function_tags         = ["strategy", "compliance", "operations"]
+business_model_tags   = ["public-sector", "regulated-incumbent"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party WEF publisher; CC BY-NC-ND, attribution preserved on every chunk."
+episodes = []
+
+[sources.wef_radio_davos.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.deutsche_bank]
+publisher_name        = "Deutsche Bank"
+base_url              = "https://corporates.db.com/multimedia"
+host                  = ""
+series_id             = "corporates_podcast"
+series_title          = "Deutsche Bank Corporates Podcast"
+primary_series_url    = "https://corporates.db.com/multimedia"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; transcripts and companion guides on corporates.db.com."
+country_region        = ["Germany", "APAC", "global"]
+industry_tags         = ["banking", "finance", "fintech"]
+function_tags         = ["strategy", "compliance", "operations"]
+business_model_tags   = ["B2B", "regulated-incumbent"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party bank publisher; companion-guide PDFs frequently linked."
+episodes = []
+
+[sources.deutsche_bank.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.ncsc]
+publisher_name        = "UK National Cyber Security Centre"
+base_url              = "https://www.ncsc.gov.uk/information/toolkit-for-boards-audio-transcripts"
+host                  = ""
+series_id             = "toolkit_for_boards"
+series_title          = "NCSC Toolkit for Boards"
+primary_series_url    = "https://www.ncsc.gov.uk/information/toolkit-for-boards-audio-transcripts"
+rights_code           = "ogl_v3"
+rights_summary        = "Open Government Licence v3.0; UK public-sector content."
+country_region        = ["UK"]
+industry_tags         = ["cybersecurity"]
+function_tags         = ["cyber-risk", "governance", "compliance"]
+business_model_tags   = ["public-sector", "regulated-incumbent"]
+source_type           = "standards_guide"
+language              = "en"
+credibility_notes     = "UK government publisher under OGL v3."
+episodes = [""]
+
+[sources.ncsc.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.microsoft_cyber]
+publisher_name        = "Microsoft Worldwide Public Sector"
+base_url              = "https://wwps.microsoft.com/blog/episodes"
+host                  = ""
+series_id             = "wwps_cyber"
+series_title          = "WWPS Cybersecurity Podcast"
+primary_series_url    = "https://wwps.microsoft.com/blog/episodes"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; transcript PDFs linked from each episode page."
+country_region        = ["US", "global"]
+industry_tags         = ["cybersecurity", "tech"]
+function_tags         = ["cyber-risk", "compliance"]
+business_model_tags   = ["B2B", "regulated-incumbent", "public-sector"]
+source_type           = "podcast_transcript_pdf"
+language              = "en"
+credibility_notes     = "First-party Microsoft public-sector publisher."
+episodes = []
+
+[sources.microsoft_cyber.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.thomson_reuters]
+publisher_name        = "Thomson Reuters"
+base_url              = "https://www.thomsonreuters.com/en-us/posts/legal"
+host                  = ""
+series_id             = "legal_podcasts"
+series_title          = "Thomson Reuters Legal Podcasts"
+primary_series_url    = "https://www.thomsonreuters.com/en-us/posts/legal"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; episode transcripts inside legal podcast posts."
+country_region        = ["US", "global"]
+industry_tags         = ["legal"]
+function_tags         = ["compliance", "governance"]
+business_model_tags   = ["B2B", "regulated-incumbent"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party legal publisher; episode transcripts inline."
+episodes = []
+
+[sources.thomson_reuters.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.frog]
+publisher_name        = "frog"
+base_url              = "https://www.frog.co/designmind"
+host                  = ""
+series_id             = "frogcast"
+series_title          = "Design Mind frogcast"
+primary_series_url    = "https://www.frog.co/designmind"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; full transcripts inline (read the full transcripts below)."
+country_region        = ["US", "global"]
+industry_tags         = ["design-firm"]
+function_tags         = ["strategy", "operations"]
+business_model_tags   = ["B2B"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party design firm publisher."
+episodes = []
+
+[sources.frog.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
+
+
+[sources.rics]
+publisher_name        = "Royal Institution of Chartered Surveyors"
+base_url              = "https://www.rics.org/news-insights/rics-podcasts"
+host                  = ""
+series_id             = "rics_podcasts"
+series_title          = "RICS Podcasts"
+primary_series_url    = "https://www.rics.org/news-insights/rics-podcasts"
+rights_code           = "free_access_copyrighted"
+rights_summary        = "Free-access copyrighted; podcasts + supporting policy briefings."
+country_region        = ["UK", "global"]
+industry_tags         = ["construction", "real-estate", "supply-chain"]
+function_tags         = ["operations", "compliance", "procurement"]
+business_model_tags   = ["B2B", "regulated-incumbent", "public-sector"]
+source_type           = "podcast_transcript_html"
+language              = "en"
+credibility_notes     = "First-party UK professional-body publisher."
+episodes = []
+
+[sources.rics.chunking_policy]
+target_tokens  = 700
+overlap_tokens = 120
