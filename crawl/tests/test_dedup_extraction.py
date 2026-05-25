@@ -330,9 +330,9 @@ def test_imd_fallback_does_not_strip_article_when_no_elementor_marker(
     bare HTML5 ``<article>`` as the post container, the
     extractor must NOT decompose that article — otherwise the
     fallback silently discards the episode body. Targeting the
-    related-cards strip on the specific
-    ``class*="card"`` selector keeps the related-widget removal
-    focused while the fallback remains robust.
+    related-cards strip on the specific ``article.card`` class
+    selector keeps the related-widget removal focused while the
+    fallback remains robust.
     """
     crawler = ImdCrawler(_config("imd", "https://www.imd.org", "fair_use_review"), tmp_path)
     text = crawler._normalize_html_bytes(
@@ -344,3 +344,28 @@ def test_imd_fallback_does_not_strip_article_when_no_elementor_marker(
     assert "Real episode body content" in text
     assert "Future layout post body" in text
     assert "RELATED CARD" not in text
+
+
+def test_imd_fallback_strip_is_class_list_precise_not_substring(tmp_path: Path) -> None:
+    """The fallback related-cards strip uses CSS class-list matching
+    (``article.card``), not substring matching, so unrelated class
+    names that *contain* the letters "card" — e.g. ``flashcard``,
+    ``postcard-summary`` — survive. Compound classes like
+    ``"card related"`` still match because ``article.card``
+    matches when ``card`` is *a class token*, not a substring.
+    """
+    crawler = ImdCrawler(_config("imd", "https://www.imd.org", "fair_use_review"), tmp_path)
+    text = crawler._normalize_html_bytes(
+        b"""<!doctype html><html><body>
+<article class="card related">RELATED CARD: compound class - must strip.</article>
+<article class="card">RELATED CARD: bare class - must strip.</article>
+<article class="flashcard"><p>FLASHCARD content - must survive.</p></article>
+<article class="postcard-summary"><p>POSTCARD content - must survive.</p></article>
+<article><h1>Future bare-article body</h1><p>BODY content - must survive.</p></article>
+</body></html>"""
+    )
+    assert "RELATED CARD" not in text
+    assert "FLASHCARD content" in text
+    assert "POSTCARD content" in text
+    assert "BODY content" in text
+    assert "Future bare-article body" in text

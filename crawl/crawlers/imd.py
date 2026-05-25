@@ -125,11 +125,17 @@ class ImdCrawler(BaseCrawler):
           blanket strip is safe and forward-compatible.
 
         * **Fallback** (wp-post marker missing): the related-
-          cards widget on IMD always uses ``class="card"``, so we
-          strip only ``<article class*="card">``. A future IMD
+          cards widget on IMD always renders ``class="card"``
+          on each article (sometimes alongside other class
+          tokens, never substring-merged into compound words
+          like ``flashcard``). The class-list selector
+          ``article.card`` matches any article whose class
+          *list* contains ``card`` — including compound classes
+          such as ``"card related"`` — without false-positives
+          on unrelated names like ``"flashcard"``. A future IMD
           layout that puts the episode body inside a bare HTML5
-          ``<article>`` therefore still survives the fallback —
-          we'd rather ship a noisy episode than silently drop the
+          ``<article>`` therefore survives the fallback — we'd
+          rather ship a noisy episode than silently drop the
           body.
         """
         soup = BeautifulSoup(raw_bytes, "lxml")
@@ -142,7 +148,7 @@ class ImdCrawler(BaseCrawler):
                 art.decompose()
         else:
             container = soup
-            for art in container.select('article[class*="card"]'):
+            for art in container.select("article.card"):
                 art.decompose()
         for level in range(1, 7):
             for h in container.find_all(f"h{level}"):

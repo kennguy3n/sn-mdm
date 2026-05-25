@@ -141,12 +141,13 @@ class MastersOfScaleCrawler(BaseCrawler):
             return ""
         blocks: list[str] = []
         captured_ids: set[int] = set()
+        top_heading_re = re.compile(r"^h[1-2]$")
         sub_heading_re = re.compile(r"^h[3-6]$")
         for sib in target.find_all_next():
             name = getattr(sib, "name", None)
             if name is None:
                 continue
-            if re.match(r"^h[1-2]$", name):
+            if top_heading_re.match(name):
                 break
             # Skip descendants of an element we already emitted —
             # otherwise ``<blockquote><p>X</p></blockquote>``
