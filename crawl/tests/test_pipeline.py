@@ -162,6 +162,52 @@ def test_dedup_skips_seen_content_hashes(tmp_path: Path) -> None:
     assert stats.episodes_skipped_dedup == 1
 
 
+def test_dedup_skip_does_not_rewrite_raw_file(tmp_path: Path) -> None:
+    """Regression: ``save_raw`` must run *after* the content-hash
+    dedup gate, not before it. The previous order made the raw
+    cache effectively write-through — a re-crawl rewrote
+    ``packs/raw/{publisher}/{slug}.html`` on every invocation
+    even though the JSONL emission and ``save_normalised`` calls
+    were correctly suppressed.
+    """
+
+    save_raw_calls: list[str] = []
+
+    class CountingCrawler(FakeCrawler):
+        def save_raw(self, raw):  # type: ignore[override]
+            save_raw_calls.append(raw.episode_slug)
+            return super().save_raw(raw)
+
+    from crawl import crawlers
+
+    crawlers._REGISTRY["fake"] = CountingCrawler  # type: ignore[attr-defined]
+
+    pipeline = Pipeline(
+        configs={"fake": _config("free_access_copyrighted")},
+        packs_root=tmp_path,
+    )
+    pipeline.run(["fake"])
+    assert save_raw_calls == ["hello-world"], (
+        "First run must persist the raw bytes (the file isn't on disk yet)"
+    )
+
+    # Second pipeline reads the governance log from disk and seeds
+    # ``_seen_content_hashes`` so the second crawl of the same
+    # episode hits the dedup gate.
+    save_raw_calls.clear()
+    pipeline2 = Pipeline(
+        configs={"fake": _config("free_access_copyrighted")},
+        packs_root=tmp_path,
+    )
+    report = pipeline2.run(["fake"])
+    stats = report.by_publisher["fake"]
+    assert stats.episodes_skipped_dedup == 1
+    assert save_raw_calls == [], (
+        "Dedup-skipped episode must not invoke save_raw — otherwise the "
+        "raw cache is wastefully rewritten on every re-crawl."
+    )
+
+
 def test_default_rights_allowlist_mirrors_pack_core() -> None:
     # Mirrors `pack_core::ingest::DEFAULT_RIGHTS_ALLOWLIST`.
     assert "ogl_v3" in DEFAULT_RIGHTS_ALLOWLIST

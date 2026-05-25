@@ -194,11 +194,25 @@ def canonicalise_text(s: str) -> str:
     - Line endings normalised to ``\\n``.
     - Tabs expanded to one space.
     - Trailing whitespace stripped per line.
-    - Leading / trailing blank lines stripped.
+    - Runs of 3+ consecutive newlines (i.e. two or more blank
+      lines) collapsed to exactly two newlines. This was
+      previously the responsibility of
+      :func:`_collapse_blank_lines`, called upstream during
+      HTML/PDF normalisation. Folding the collapse into
+      ``canonicalise_text`` itself removes the implicit ordering
+      dependency: a future caller that bypasses
+      ``_collapse_blank_lines`` (e.g. a new crawler emitting
+      markdown directly) still produces a digest that matches the
+      Rust ``pack_core::ingest::canonicalise_text``. Without this,
+      the BLAKE3 content_hash would diverge cross-language for
+      visually-identical text, silently breaking dedup.
+    - Leading / trailing whitespace stripped from the result.
     """
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     lines = [line.replace("\t", " ").rstrip() for line in s.split("\n")]
-    return "\n".join(lines).strip()
+    joined = "\n".join(lines)
+    collapsed = re.sub(r"\n{3,}", "\n\n", joined)
+    return collapsed.strip()
 
 
 def content_hash(text: str) -> str:
@@ -571,7 +585,12 @@ class BaseCrawler:
         """Politely fetch ``url``.
 
         Enforces robots.txt, the configured rate limit, and a single
-        retry on a transient 5xx.
+        retry on transient failures only — 5xx, 408 Request Timeout,
+        and 429 Too Many Requests (with ``Retry-After`` honoured).
+        Other 4xx responses (401, 403, 404, 410, …) and network-layer
+        errors that look like permanent client problems fail fast on
+        the first attempt; retrying them would just double the
+        latency on broken URLs.
         """
         rp = self._robots_parser(url)
         ua = self.session.headers.get("User-Agent", DEFAULT_USER_AGENT)
@@ -581,18 +600,77 @@ class BaseCrawler:
         headers: dict[str, str] = {}
         if accept:
             headers["Accept"] = accept
+        # Statuses worth retrying:
+        #
+        # * 5xx — transient server-side failure (RFC 9110 §15.6).
+        # * 408 Request Timeout — server is telling us to re-send
+        #   (RFC 9110 §15.5.9).
+        # * 429 Too Many Requests — rate-limited; honour
+        #   ``Retry-After`` (RFC 6585 §4 / RFC 9110 §15.5.18).
+        #
+        # Every other 4xx (401, 403, 404, 410, …) is a permanent
+        # client-side error and will not resolve on retry. Retrying
+        # them would burn one extra request per failure and double
+        # the perceived latency on broken URLs in the source
+        # registry. Fail fast on those instead — the
+        # ``initial_sync`` generator already catches per-episode so
+        # one bad URL does not bring down the whole publisher.
+        retryable_statuses = frozenset({408, 429, 500, 502, 503, 504})
+        max_attempts = 2
         last_exc: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(max_attempts):
+            is_last = attempt == max_attempts - 1
             try:
                 resp = self.session.get(url, headers=headers, timeout=30)
-                if resp.status_code >= 500:
-                    raise requests.HTTPError(f"{resp.status_code} {resp.reason}")
-                resp.raise_for_status()
-                return resp
-            except (requests.RequestException, requests.HTTPError) as exc:
+            except requests.RequestException as exc:
+                # Network-layer (DNS, connection reset, read timeout):
+                # always retryable while attempts remain.
                 last_exc = exc
-                LOG.warning("fetch %s failed (attempt %d): %s", url, attempt + 1, exc)
+                if is_last:
+                    break
+                LOG.warning(
+                    "fetch %s network error (attempt %d): %s", url, attempt + 1, exc
+                )
                 time.sleep(1.0 * (attempt + 1))
+                continue
+
+            if resp.ok:
+                return resp
+
+            if resp.status_code in retryable_statuses and not is_last:
+                # ``Retry-After`` per RFC 9110 §10.2.3: either a
+                # delta-seconds integer or an HTTP-date. We honour
+                # the integer form (the common case for 429) and
+                # ignore the date form rather than parse it
+                # incorrectly — the linear backoff fallback is a
+                # safe upper bound.
+                retry_after = resp.headers.get("Retry-After", "").strip()
+                backoff = (
+                    float(retry_after) if retry_after.isdigit() else 1.0 * (attempt + 1)
+                )
+                LOG.warning(
+                    "fetch %s got retryable %d (attempt %d); sleeping %.1fs",
+                    url,
+                    resp.status_code,
+                    attempt + 1,
+                    backoff,
+                )
+                time.sleep(backoff)
+                continue
+
+            # Non-retryable HTTP status (most 4xx, or last-attempt
+            # 5xx). Surface immediately; ``raise_for_status`` builds
+            # the canonical ``HTTPError`` with ``resp`` attached so
+            # callers can introspect.
+            resp.raise_for_status()
+            # Defensive: ``raise_for_status`` always raises for
+            # non-ok responses, so this line is unreachable. Kept
+            # as a fail-loud guard if a future ``requests`` release
+            # ever changes that contract.
+            raise requests.HTTPError(  # pragma: no cover - defensive
+                f"{resp.status_code} {resp.reason}", response=resp
+            )
+
         assert last_exc is not None
         raise last_exc
 

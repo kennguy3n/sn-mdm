@@ -28,11 +28,41 @@ def test_slugify_basic() -> None:
 
 def test_canonicalise_text_normalises_whitespace_and_line_endings() -> None:
     # Line endings -> \n, tabs -> single space, trailing whitespace stripped
-    # per line, leading + trailing blank lines trimmed. Internal blank lines
-    # are preserved so paragraph structure survives the hash canonicalisation.
+    # per line, leading + trailing blank lines trimmed. Runs of 3+ newlines
+    # (2+ blank lines) collapse to exactly two so paragraph structure
+    # survives hash canonicalisation but extra blank lines don't change the
+    # digest.
     raw = "  \r\nHello\r\nworld   \r\n\n\nfoo\tbar  \r\n  "
     canon = canonicalise_text(raw)
-    assert canon == "Hello\nworld\n\n\nfoo bar"
+    assert canon == "Hello\nworld\n\nfoo bar"
+
+
+def test_canonicalise_text_collapses_blank_lines() -> None:
+    # Mirrors ``pack_core::ingest::canonicalise_text_matches_python_blank_line_collapse``.
+    # CRLF + bare CR + LF must all funnel into the same canonical
+    # form; 4 newlines (3 blank lines) must collapse to 2 newlines
+    # (1 blank line); whitespace-only "blank" lines must collapse
+    # too because rstrip turns them into empty lines first.
+    assert canonicalise_text("a\r\n\r\n\r\n\r\nb") == "a\n\nb"
+    assert (
+        canonicalise_text("  \r\nHello\tworld   \n\n\n\nfoo\tbar  \r\n  ")
+        == "Hello world\n\nfoo bar"
+    )
+    assert canonicalise_text("first\n   \n\t\n  \nsecond") == "first\n\nsecond"
+
+
+def test_canonicalise_text_blank_line_collapse_is_hash_stable() -> None:
+    # Two visually-identical inputs that differ only in the number
+    # of blank lines between paragraphs must hash identically once
+    # canonicalised. This is the defense-in-depth invariant that
+    # ``canonicalise_text`` was extended to enforce so a future
+    # caller bypassing ``_collapse_blank_lines`` upstream cannot
+    # silently produce a different ``content_hash``.
+    sparse = "para one\n\npara two"
+    dense = "para one\n\n\n\n\npara two"
+    assert content_hash(canonicalise_text(sparse)) == content_hash(
+        canonicalise_text(dense)
+    )
 
 
 def test_content_hash_is_canonical() -> None:
@@ -44,9 +74,9 @@ def test_content_hash_is_canonical() -> None:
     a = "Hello\r\nworld   "
     b = "Hello\nworld"
     assert content_hash(canonicalise_text(a)) == content_hash(canonicalise_text(b))
-    # The hex digest length is at least 32 (SHA-256 fallback) or 64
-    # (BLAKE3) depending on which backend is installed.
-    assert len(content_hash(canonicalise_text(a))) >= 32
+    # ``blake3`` is a hard dependency (see ``crawl/requirements.txt``)
+    # so the digest is always a 64-char BLAKE3 hex string.
+    assert len(content_hash(canonicalise_text(a))) == 64
     # Sanity check: two distinct canonical strings must hash
     # distinctly so the dedup gate doesn't false-positive.
     assert content_hash(canonicalise_text(a)) != content_hash(
@@ -212,3 +242,168 @@ def test_oversize_turn_carries_overlap_into_next_turn() -> None:
         prev_tail_words,
         boundary_head,
     )
+
+
+def test_fetch_does_not_retry_on_4xx() -> None:
+    """Regression: ``BaseCrawler.fetch`` previously retried on every
+    non-2xx response because both ``raise_for_status`` (4xx) and
+    the explicit 5xx ``raise`` landed in the same retry-catch.
+    The fix splits retryable (5xx, 408, 429) from non-retryable
+    (other 4xx) statuses — 404 must fail on the first request,
+    not the second.
+    """
+
+    from unittest.mock import MagicMock, patch
+
+    import requests
+
+    from crawl.crawlers.base import BaseCrawler, CrawlerConfig
+
+    crawler = BaseCrawler.__new__(BaseCrawler)
+    crawler.config = CrawlerConfig(
+        publisher_id="fake",
+        publisher_name="Fake",
+        base_url="https://example.com",
+        rights_code="free_access_copyrighted",
+        rights_summary="",
+    )
+    crawler._last_request_at = 0.0
+    crawler.rate_limit_seconds = 0.0
+    crawler._robots_cache = {}
+    crawler.session = MagicMock()
+    crawler.session.headers = {"User-Agent": "test-agent"}
+
+    # Build a 404 response with the standard ``raise_for_status``
+    # contract — calling it must raise ``requests.HTTPError``.
+    resp_404 = MagicMock(spec=requests.Response)
+    resp_404.status_code = 404
+    resp_404.ok = False
+    resp_404.reason = "Not Found"
+    resp_404.headers = {}
+    resp_404.raise_for_status.side_effect = requests.HTTPError(
+        "404 Not Found", response=resp_404
+    )
+    crawler.session.get.return_value = resp_404
+
+    # Robots.txt always allows in this test.
+    robots = MagicMock()
+    robots.can_fetch.return_value = True
+    with patch.object(crawler, "_robots_parser", return_value=robots):
+        try:
+            crawler.fetch("https://example.com/missing")
+        except requests.HTTPError:
+            pass
+        else:
+            raise AssertionError("404 must surface as HTTPError")
+
+    # The critical assertion: exactly ONE call to session.get for a
+    # 404. The earlier buggy version made two.
+    assert crawler.session.get.call_count == 1, (
+        f"4xx must not trigger a retry, got "
+        f"{crawler.session.get.call_count} requests"
+    )
+
+
+def test_fetch_retries_on_5xx_then_succeeds() -> None:
+    """5xx responses must be retried (and a follow-up 200 must be
+    returned cleanly).
+    """
+
+    from unittest.mock import MagicMock, patch
+
+    import requests
+
+    from crawl.crawlers.base import BaseCrawler, CrawlerConfig
+
+    crawler = BaseCrawler.__new__(BaseCrawler)
+    crawler.config = CrawlerConfig(
+        publisher_id="fake",
+        publisher_name="Fake",
+        base_url="https://example.com",
+        rights_code="free_access_copyrighted",
+        rights_summary="",
+    )
+    crawler._last_request_at = 0.0
+    crawler.rate_limit_seconds = 0.0
+    crawler._robots_cache = {}
+    crawler.session = MagicMock()
+    crawler.session.headers = {"User-Agent": "test-agent"}
+
+    resp_503 = MagicMock(spec=requests.Response)
+    resp_503.status_code = 503
+    resp_503.ok = False
+    resp_503.reason = "Service Unavailable"
+    resp_503.headers = {}
+
+    resp_200 = MagicMock(spec=requests.Response)
+    resp_200.status_code = 200
+    resp_200.ok = True
+
+    crawler.session.get.side_effect = [resp_503, resp_200]
+
+    robots = MagicMock()
+    robots.can_fetch.return_value = True
+    with (
+        patch.object(crawler, "_robots_parser", return_value=robots),
+        patch("crawl.crawlers.base.time.sleep"),  # silence backoff
+    ):
+        result = crawler.fetch("https://example.com/flaky")
+
+    assert result is resp_200
+    assert crawler.session.get.call_count == 2
+
+
+def test_fetch_retries_on_429_with_retry_after() -> None:
+    """429 must be retried and the ``Retry-After`` integer header
+    must be honoured for backoff.
+    """
+
+    from unittest.mock import MagicMock, patch
+
+    import requests
+
+    from crawl.crawlers.base import BaseCrawler, CrawlerConfig
+
+    crawler = BaseCrawler.__new__(BaseCrawler)
+    crawler.config = CrawlerConfig(
+        publisher_id="fake",
+        publisher_name="Fake",
+        base_url="https://example.com",
+        rights_code="free_access_copyrighted",
+        rights_summary="",
+    )
+    crawler._last_request_at = 0.0
+    crawler.rate_limit_seconds = 0.0
+    crawler._robots_cache = {}
+    crawler.session = MagicMock()
+    crawler.session.headers = {"User-Agent": "test-agent"}
+
+    resp_429 = MagicMock(spec=requests.Response)
+    resp_429.status_code = 429
+    resp_429.ok = False
+    resp_429.reason = "Too Many Requests"
+    resp_429.headers = {"Retry-After": "7"}
+
+    resp_200 = MagicMock(spec=requests.Response)
+    resp_200.status_code = 200
+    resp_200.ok = True
+
+    crawler.session.get.side_effect = [resp_429, resp_200]
+
+    robots = MagicMock()
+    robots.can_fetch.return_value = True
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    with (
+        patch.object(crawler, "_robots_parser", return_value=robots),
+        patch("crawl.crawlers.base.time.sleep", side_effect=fake_sleep),
+    ):
+        result = crawler.fetch("https://example.com/rate-limited")
+
+    assert result is resp_200
+    assert crawler.session.get.call_count == 2
+    # The 429 path must have slept for the Retry-After interval.
+    assert 7.0 in sleeps, sleeps

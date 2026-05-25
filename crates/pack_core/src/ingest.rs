@@ -571,20 +571,54 @@ impl PackStore {
 /// * Line endings normalised to `\n`.
 /// * Tab characters expanded to a single space.
 /// * Trailing whitespace stripped from every line.
-/// * Leading + trailing blank lines collapsed.
+/// * Runs of 3+ consecutive newlines (i.e. 2+ blank lines)
+///   collapsed to exactly two newlines.
+/// * Leading + trailing whitespace stripped from the result.
+///
+/// The blank-line collapse mirrors the Python
+/// `crawl.crawlers.base.canonicalise_text` step which itself
+/// mirrors the upstream `_collapse_blank_lines` regex
+/// (`re.sub(r"\n{3,}", "\n\n", …)`). Folding it into the canonical
+/// function — rather than relying on the upstream HTML/PDF
+/// normaliser to have already collapsed — guarantees the two
+/// language sides produce byte-for-byte identical canonical text
+/// regardless of which path produced the input. Without it a
+/// future caller that bypassed the upstream collapse (e.g. a new
+/// crawler emitting markdown directly) would produce a different
+/// BLAKE3 digest from its Rust ingest counterpart even when the
+/// visible text is identical, silently breaking cross-language
+/// dedup.
 ///
 /// Returns an owned `String` so the original chunk text is left
 /// unchanged (it goes into the row verbatim — we want the canonical
 /// form only for hashing).
 fn canonicalise_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for line in s.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
-        let line = line.replace('\t', " ");
-        let trimmed = line.trim_end();
-        out.push_str(trimmed);
-        out.push('\n');
+    // 1. Normalise line endings + tabs, rstrip per line.
+    let normalised = s.replace("\r\n", "\n").replace('\r', "\n");
+    let mut rstripped = String::with_capacity(normalised.len());
+    for line in normalised.split('\n') {
+        let expanded = line.replace('\t', " ");
+        rstripped.push_str(expanded.trim_end());
+        rstripped.push('\n');
     }
-    out.trim().to_string()
+    // 2. Collapse runs of 3+ ``\n`` to exactly two. We walk the
+    //    string once with a small state machine instead of
+    //    pulling in the ``regex`` crate — the workspace
+    //    intentionally keeps its dependency surface narrow.
+    let mut collapsed = String::with_capacity(rstripped.len());
+    let mut newline_run = 0usize;
+    for ch in rstripped.chars() {
+        if ch == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                collapsed.push(ch);
+            }
+        } else {
+            newline_run = 0;
+            collapsed.push(ch);
+        }
+    }
+    collapsed.trim().to_string()
 }
 
 // Tiny inline hex impl. Kept here rather than pulling the `hex`
@@ -778,5 +812,26 @@ mod tests {
             fts_text, original.chunk_text,
             "FTS5 row must still point at the original text",
         );
+    }
+
+    #[test]
+    fn canonicalise_text_matches_python_blank_line_collapse() {
+        // Same input the Python ``test_canonicalise_text_collapses_blank_lines``
+        // uses — both sides must agree byte-for-byte.
+        let raw = "a\r\n\r\n\r\n\r\nb";
+        let canon = canonicalise_text(raw);
+        assert_eq!(canon, "a\n\nb");
+
+        // ``\t`` expansion + per-line rstrip + 3+ newline collapse
+        // composed in one pass.
+        let mixed = "  \r\nHello\tworld   \n\n\n\nfoo\tbar  \r\n  ";
+        let canon = canonicalise_text(mixed);
+        assert_eq!(canon, "Hello world\n\nfoo bar");
+
+        // Whitespace-only "blank" lines must also collapse — rstrip
+        // turns them into empty lines first.
+        let ws_blanks = "first\n   \n\t\n  \nsecond";
+        let canon = canonicalise_text(ws_blanks);
+        assert_eq!(canon, "first\n\nsecond");
     }
 }

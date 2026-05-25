@@ -172,12 +172,23 @@ class Pipeline:
                     )
                     continue
 
-                crawler.save_raw(raw)
+                # Normalise *first* so the content-hash is available
+                # for the dedup short-circuit. Only persist the raw
+                # bytes once we've confirmed this episode is genuinely
+                # new — otherwise a re-crawl rewrites the same
+                # ``packs/raw/{publisher}/{slug}.{ext}`` file on every
+                # invocation even though the JSONL emission and
+                # ``save_normalised`` calls are correctly suppressed
+                # by the dedup gate. The previous order (``save_raw``
+                # → ``normalize`` → dedup) made the raw cache
+                # effectively write-through, defeating part of the
+                # point of having a content-hash dedup at all.
                 normalised = crawler.normalize(raw)
                 if normalised.content_hash in self._seen_content_hashes:
                     stats.episodes_skipped_dedup += 1
                     continue
                 self._seen_content_hashes.add(normalised.content_hash)
+                crawler.save_raw(raw)
                 crawler.save_normalised(normalised)
 
                 episode_dict = crawler.emit_episode(normalised)
