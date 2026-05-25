@@ -13,6 +13,7 @@ The episode slug in the source registry is the path under
 
 from __future__ import annotations
 
+import logging
 import re
 import urllib.parse
 
@@ -20,15 +21,51 @@ from bs4 import BeautifulSoup
 
 from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 
+LOG = logging.getLogger(__name__)
+
+# BCG ships a Google-flavoured XML sitemap. Each entry is a full
+# canonical URL — the show pages, the episode pages, and a few
+# series-landing pages share the ``/featured-insights/podcasts/``
+# prefix, so we keep only paths with at least one ``<show>/<slug>``
+# component (i.e. two segments after the prefix).
+_SITEMAP_URLS = (
+    "https://www.bcg.com/google_sitemap-content.xml",
+    "https://www.bcg.com/google_sitemap-latest.xml",
+)
+_EPISODE_LOC_RE = re.compile(
+    r"<loc>\s*https?://(?:www\.)?bcg\.com/featured-insights/podcasts/"
+    r"([a-z0-9\-]+/[a-z0-9\-]+)/?\s*</loc>"
+)
+
 
 class BcgCrawler(BaseCrawler):
     publisher_id = "bcg"
     publisher_name = "BCG"
+    DISCOVER_CAP = 25
 
     BASE_URL = "https://www.bcg.com"
 
     def _episode_url(self, slug: str) -> str:
         return f"{self.BASE_URL}/featured-insights/podcasts/{slug}"
+
+    def _discover_episode_slugs(self) -> list[str]:
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for sitemap_url in _SITEMAP_URLS:
+            try:
+                resp = self.fetch(sitemap_url)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("bcg: %s failed: %s", sitemap_url, exc)
+                continue
+            for m in _EPISODE_LOC_RE.finditer(resp.text):
+                slug = m.group(1)
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                slugs.append(slug)
+                if len(slugs) >= self.DISCOVER_CAP:
+                    return slugs
+        return slugs
 
     def fetch_transcript(self, episode_slug: str) -> RawEpisode:
         # Step 1: landing page.

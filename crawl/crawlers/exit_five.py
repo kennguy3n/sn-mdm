@@ -9,6 +9,7 @@ transcript text in paragraph form (speaker labels follow the
 
 from __future__ import annotations
 
+import logging
 import re
 import urllib.parse
 
@@ -16,13 +17,52 @@ from bs4 import BeautifulSoup
 
 from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
 
+LOG = logging.getLogger(__name__)
+
+_INDEX_URL = "https://www.exitfive.com/podcast"
+# Accept both relative ("/podcast/<slug>") and absolute
+# ("https://www.exitfive.com/podcast/<slug>") hrefs. Ghost
+# emits its episode tiles as relative anchors so the absolute-
+# only pattern silently missed every match.
+_HREF_RE = re.compile(
+    r"^(?:https?://(?:www\.)?exitfive\.com)?/podcast/([a-z0-9][a-z0-9\-]*)/?$"
+)
+
 
 class ExitFiveCrawler(BaseCrawler):
     publisher_id = "exit_five"
     publisher_name = "Exit Five"
+    DISCOVER_CAP = 25
 
     def _episode_url(self, slug: str) -> str:
         return f"https://www.exitfive.com/podcast/{slug}"
+
+    def _discover_episode_slugs(self) -> list[str]:
+        """Walk the Exit Five podcast index. Each episode card on
+        ``/podcast`` carries an absolute ``<a href>`` pointing at
+        the per-episode page. We match against the canonical
+        ``exitfive.com/podcast/<slug>`` pattern so reposts on
+        other Ghost-hosted vanity domains don't sneak in.
+        """
+        try:
+            resp = self.fetch(_INDEX_URL)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("exit_five: index walk failed: %s", exc)
+            return []
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for a in BeautifulSoup(resp.text, "lxml").find_all("a", href=True):
+            m = _HREF_RE.match(a["href"])
+            if not m:
+                continue
+            slug = m.group(1)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+            if len(slugs) >= self.DISCOVER_CAP:
+                break
+        return slugs
 
     def fetch_transcript(self, episode_slug: str) -> RawEpisode:
         url = self._episode_url(episode_slug)

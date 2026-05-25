@@ -61,13 +61,53 @@ Every episode is tagged across the 5 families
 | frog (Design Mind frogcast)            | `frog.py`                     | `frog.co/designmind/design-mind-frogcast-{slug}`                     | `free_access_copyrighted` | Design / strategy |
 | RICS (Royal Institution of Chartered Surveyors) | `rics.py`            | `rics.org/news-insights/{slug}` + companion PDFs                     | `free_access_copyrighted` | Construction / real estate |
 
+## Index discovery status
+
+`BaseCrawler.initial_sync` merges the configured seed list
+(`config.episodes`) with whatever
+`_discover_episode_slugs` returns. A walker that returns the
+empty list is purely seed-driven. The table below captures the
+state on this PR — it's the canonical reference for what a
+fresh `python -m crawl.pipeline` run will actually pull from
+each source.
+
+| Publisher          | Walker channel             | Status                                                                                            |
+| ------------------ | -------------------------- | ------------------------------------------------------------------------------------------------- |
+| `a16z`             | `podcast-sitemap.xml`      | working — 25 episode permalinks per run (capped).                                                  |
+| `acquired`         | `/episodes` HTML index     | working — 20 episode slugs per run + 4 curated seeds, deduped.                                     |
+| `bcg`              | `google_sitemap-content`   | working — 15 episode permalinks (Imagine This series).                                             |
+| `exit_five`        | `/podcast` HTML index      | working — 12 episode slugs per run.                                                                |
+| `frog`             | `/designmind` HTML index   | working — 4 frogcast permalinks.                                                                   |
+| `imd`              | `/ibyimd/category/podcasts/` HTML | working — 24 episode permalinks across series.                                              |
+| `masters_of_scale` | `episode-sitemap.xml`      | working — first 25 of 700+ permalinks (WordPress sitemap).                                         |
+| `microsoft_cyber`  | `post-sitemap{1,2}.xml`    | working — 25 episode permalinks (`Public Sector Future` + `Future of Infrastructure`). One per-run skip when `traffic.libsyn.com` `robots.txt` disallows a transcript PDF — expected behaviour.           |
+| `ncsc`             | (single-page, seeded)      | working — 1 verbatim CISO-board transcript page, OGL-v3.                                           |
+| `people_matters`   | `sitemap.xml/podcast`      | working — 25 of 61 podcast permalinks.                                                             |
+| `deutsche_bank`    | n/a                        | **Gap** — `corporates.db.com` is a Drupal CMS that renders the episode list client-side and ships no per-show sitemap. Needs a headless-browser walker (out of scope for this PR). |
+| `mckinsey`         | n/a                        | **Gap** — `www.mckinsey.com` times out on every plain HTTPS GET from this VM (likely a WAF rule). Needs either a different egress IP or a headless-browser walker. |
+| `rbc_disruptors`   | n/a                        | **Gap** — `thoughtleadership.rbc.com/rbc-disruptors-archives/` redirects to `www.rbc.com/en/thought-leadership/disruptors/` which is fully client-rendered. No sitemap subset for podcasts. |
+| `rics`             | n/a                        | **Gap** — `rics.org` sitemap lists category landings only, not individual episodes. The podcast cards on the category pages are React-rendered. |
+| `ted_worklife`     | n/a                        | **Gap** — TED migrated to a Next.js SPA; the `worklife` season pages are client-rendered and the global sitemap only lists playlists, not per-episode transcript pages. The historical `*-transcript` URL pattern returns 404. |
+| `thomson_reuters`  | n/a                        | **Gap** — the global sitemap is a flat urlset with no podcast prefix; the legal-blog category page is React-rendered. |
+| `wef_radio_davos`  | n/a                        | **Gap** — `weforum.org` returns HTTP 403 on every endpoint accessed without a residential browser fingerprint. The sitemap is gated by the same WAF rule. |
+
+The seven "Gap" rows are the publishers where a single follow-up
+work item (headless browser walker, residential proxy, or
+manually-curated seed list updated periodically) is needed to
+unlock discovery. The architecture supports them — the
+`_discover_episode_slugs` hook is there and the rest of the
+pipeline is publisher-agnostic — they just don't have a working
+discovery channel yet from this network egress.
+
 ## Adding a new source
 
 1. Pick a stable `publisher_id` (lower-snake-case).
 2. Create `crawl/crawlers/{publisher_id}.py` with a class deriving
    `BaseCrawler` and implementing `_episode_url`,
-   `fetch_transcript`, and a source-specific `_normalize_html_bytes`
-   (or `_normalize_pdf_bytes`).
+   `fetch_transcript`, a source-specific `_normalize_html_bytes`
+   (or `_normalize_pdf_bytes`), and — unless the source is purely
+   seed-driven — `_discover_episode_slugs` returning up to
+   `DISCOVER_CAP` (default 25) per-episode slugs.
 3. Register the class in `crawl/crawlers/__init__.py::_REGISTRY`.
 4. Add a `[sources.{publisher_id}]` block to `crawl_config.toml`
    with the tag families and rights code.

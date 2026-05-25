@@ -10,15 +10,26 @@ venv/
 .env
 *.egg-info/
 
-# Crawl outputs (large, regenerated)
+# Crawl outputs.
+#
+# `packs/raw/` and `packs/normalized/` stay out of git — they
+# hold the raw HTML/PDF bytes and the normalised markdown that
+# (a) are large enough to bloat the repo and (b) are not
+# necessarily redistributable for every rights code.
+#
+# The JSONL outputs ARE committed: `packs/metadata/*.jsonl`,
+# `packs/chunks/*.jsonl`, and `packs/governance/*.jsonl`. They
+# encode the chunked text + provenance and form the canonical
+# input the Rust `pack-build` CLI consumes. Committing them
+# gives reviewers an auditable record of *what* was crawled at
+# each PR and lets ``pack-build`` reproduce the .pack file
+# deterministically.
 packs/raw/**/*
 packs/normalized/**/*
-packs/metadata/**/*
-packs/chunks/**/*
-packs/governance/**/*
 !packs/**/.gitkeep
 
-# Built pack artifacts
+# Built pack artifacts — ship via GitHub Release assets, not
+# in-tree.
 *.pack
 *.pack.idx
 

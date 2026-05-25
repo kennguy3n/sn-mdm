@@ -8,14 +8,28 @@ transcript inline with an introductory paragraph that flags it
 
 from __future__ import annotations
 
+import logging
+import re
+
 from bs4 import BeautifulSoup
 
 from .base import BaseCrawler, RawEpisode, _collapse_blank_lines
+
+LOG = logging.getLogger(__name__)
+
+# Frog ships relative ("/designmind/<slug>") anchors on the index
+# page. Some posts are non-frogcast editorial pieces — the
+# ``design-mind-frogcast-`` prefix filter keeps the walker
+# scoped to podcast episodes only.
+_HREF_RE = re.compile(
+    r"^(?:https?://(?:www\.)?frog\.co)?/designmind/(design-mind-frogcast-[a-z0-9][a-z0-9\-]*)/?$"
+)
 
 
 class FrogCrawler(BaseCrawler):
     publisher_id = "frog"
     publisher_name = "frog"
+    DISCOVER_CAP = 25
 
     BASE = "https://www.frog.co/designmind"
 
@@ -23,6 +37,27 @@ class FrogCrawler(BaseCrawler):
         if slug.startswith("design-mind-frogcast"):
             return f"{self.BASE}/{slug}"
         return f"{self.BASE}/design-mind-frogcast-{slug}"
+
+    def _discover_episode_slugs(self) -> list[str]:
+        try:
+            resp = self.fetch(self.BASE)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("frog: index walk failed: %s", exc)
+            return []
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for a in BeautifulSoup(resp.text, "lxml").find_all("a", href=True):
+            m = _HREF_RE.match(a["href"])
+            if not m:
+                continue
+            slug = m.group(1)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+            if len(slugs) >= self.DISCOVER_CAP:
+                break
+        return slugs
 
     def fetch_transcript(self, episode_slug: str) -> RawEpisode:
         url = self._episode_url(episode_slug)
